@@ -7,6 +7,11 @@ tasks:
     cmds:
       - |
         set -euo pipefail
+        # 요청: 소비 저장소 루트에서 테스트 호출. 기대: 실제 작업 디렉터리가 ROOT_DIR와 일치.
+        if [ "$(pwd)" != "$(cd {{.ROOT_DIR | shellQuote}} && pwd)" ]; then
+          echo 'security:test must run in ROOT_DIR' >&2
+          exit 1
+        fi
         tmp=$(mktemp -d -p . .security-test.XXXXXXXX)
         fixture="$tmp/state.json"
         log="$tmp/log"

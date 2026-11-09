@@ -23,4 +23,19 @@ jobs:
           check-latest: true
           cache: false
       - run: go install github.com/go-task/task/v3/cmd/task@v3.54.0
-      - run: task security:test
+      - name: Verify shared tasks through consumer include
+        run: |
+          consumer_dir=$(mktemp -d)
+          trap 'rm -rf "$consumer_dir"' EXIT
+          mkdir "$consumer_dir/tasks"
+          cp Taskfile.yml Taskfile.test.yml "$consumer_dir/tasks/"
+          cat > "$consumer_dir/Taskfile.yml" <<'YAML'
+          version: '3'
+          includes:
+            shared:
+              taskfile: ./tasks/Taskfile.yml
+              dir: .
+              flatten: true
+          YAML
+          cd "$consumer_dir"
+          task security:test
