@@ -66,7 +66,8 @@ vars:
     sha=$(printf '%s' "$run" | jq -j .head_sha)
     marker='<!-- dependency-security-issue:v1 -->'
     run_number=$(printf '%s' "$run" | jq -je '.run_number | numbers | tostring')
-    body=$(printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" \
+    source="<!-- dependency-security-source:$sha:$GITHUB_RUN_ID -->"
+    body=$(printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
       'main 정기 의존성 검사에서 기준 이상의 보안 취약점이 발견되었습니다.' '' \
       "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)" '' \
       '| 취약점 발견 모듈 | 상세 결과 |' '| --- | --- |'
@@ -81,14 +82,13 @@ vars:
     issues=$(api GET 'issues?state=all&creator=github-actions%5Bbot%5D&per_page=100' --paginate --slurp |
       jq --arg marker "$marker" '[.[][] | select(has("pull_request") | not) |
         select(.user.login == "github-actions[bot]" and ((.body // "") | contains($marker)))]')
-    # A report-only retry increases GITHUB_RUN_ATTEMPT without running a new scan.
-    replayed=$(printf '%s' "$issues" | jq -j --argjson run "$run_number" --argjson findings "$findings" '
-      ($findings | map(.run_attempt // 1) | max) as $scan_attempt |
-      ($findings | map(.completed_at // "") | max) as $completed |
+    # Retries keep the same commit and run ID. The next scheduled run has a new ID.
+    replayed=$(printf '%s' "$issues" | jq -j --arg source "$source" --arg sha "$sha" \
+      --arg path "/actions/runs/$GITHUB_RUN_ID/" --argjson run "$run_number" '
       any(.[] | select(.state == "closed");
-        [(.body | scan("<!-- dependency-security-run:([0-9]+):([0-9]+) -->")) | map(tonumber)] as $orders |
-        any($orders[]; . >= [$run, $scan_attempt]) or
-        ($completed != "" and .closed_at != null and .closed_at >= $completed)) | tostring')
+        (.body | contains($source) or (contains($sha) and contains($path))) or
+        ([.body | scan("<!-- dependency-security-run:([0-9]+):([0-9]+) -->") | .[0] | tonumber] |
+          any(.[]; . >= $run))) | tostring')
     if [ "$replayed" = true ]; then
       exit 0
     fi
@@ -178,8 +178,8 @@ tasks:
             return 1
           fi
           case "$method $endpoint" in
-            'GET actions/runs/123') jq .run "$fixture" ;;
-            'GET actions/runs/123/jobs?filter=all&per_page=100')
+            'GET actions/runs/'"$GITHUB_RUN_ID") jq .run "$fixture" ;;
+            'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100')
               jq '[range(0; (.jobs | length); 100) as $i | {jobs: .jobs[$i:$i+100]}]' "$fixture" ;;
             'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100')
               jq '.issues | [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
@@ -226,7 +226,8 @@ tasks:
         change '.jobs += [(.jobs[0] | .name = "dependency-scan (scrypter)" | .steps[0].conclusion = "skipped")]'
         invoke 0
         check '(.issues | length) == 1 and (.comments | length) == 1 and
-          (.issues[0].body | contains("dependency-security-issue:v1") and contains("bcrypter") and
+          (.issues[0].body | contains("dependency-security-issue:v1") and
+          contains("dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:123") and contains("bcrypter") and
           contains("/job/bcrypter") and contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") and contains("scrypter")) and
           (.comments[0].body | contains("@w00j00ng") and contains("2026-11-07"))'
         echo 'PASS 1: finding creates one issue and one mention'
@@ -239,8 +240,9 @@ tasks:
           (.issues[0].body | contains("helloworld") and (contains("dependency-scan (bcrypter)") | not) and
           (contains("검사 오류") | not))'
         change '.run.created_at = "2026-11-07T22:23:00Z" | .run.run_number += 1'
-        invoke 0
-        check '(.issues | length) == 1 and (.comments | length) == 2'
+        GITHUB_RUN_ID=124 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 2 and
+          (.issues[0].body | contains("dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:124"))'
         echo 'PASS 2: unresolved findings notify again on the next scheduled date'
 
         # 요청: 기존 이슈 닫은 뒤 발견. 기대: 닫힌 기록 보존, 새 이슈/댓글 생성.
@@ -248,7 +250,7 @@ tasks:
         change '.issues[0].state = "closed"'
         closed=$(jq -c .issues[0] "$fixture")
         change '.run.run_number += 1'
-        invoke 0
+        GITHUB_RUN_ID=124 invoke 0
         check "(.issues | length) == 2 and .issues[0] == $closed and .issues[1].number == 43 and
           .issues[1].state == \"open\" and (.comments | length) == 2 and .comments[1].issue_number == 43"
         echo 'PASS 3: closed issue preserved'
@@ -428,7 +430,7 @@ tasks:
         GITHUB_RUN_ATTEMPT=3 invoke 0
         check '(.issues[0].body | contains("dependency-security-run:10:3") and contains("helloworld")) and (.comments | length) == 1'
         change '.run.run_number = 11'
-        invoke 0
+        GITHUB_RUN_ID=124 invoke 0
         check '(.issues[0].body | contains("dependency-security-run:11:2"))'
         echo 'PASS 15: stale reports cannot overwrite newer results'
 
@@ -440,65 +442,67 @@ tasks:
           (.issues[0].body | contains("dependency-security-run:10:2"))'
         echo 'PASS 16: existing issues migrate without duplication'
 
-        # 요청: 이슈 조치·종료 후 과거 보고 또는 동일 검사 재전송. 기대: 이슈/댓글 쓰기 없음.
-        for scenario in older-run report-only clean-module-only legacy-issue closed-second-page; do
+
+        # 요청: 닫힌 이슈에 보고한 실행의 재시도와 과거 실행. 기대: 새 이슈/댓글 없음.
+        for scenario in older-run report-only rescan clean-module-only source-only legacy-order legacy-link closed-second-page; do
           reset; invoke 0
-          change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T01:00:00Z" | .requests = []'
+          change '.issues[0].state = "closed" | .requests = []'
+          report_id=123
           case "$scenario" in
-            older-run) change '.run.run_number = 9' ;;
+            older-run) change '.run.run_number = 9'; report_id=122 ;;
+            rescan)
+              change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 | .completed_at = "2026-11-07T02:00:00Z")]' ;;
             clean-module-only)
               change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 | .name = "dependency-scan (scrypter)" |
                 .conclusion = "success" | .steps[0].conclusion = "skipped")]' ;;
-            legacy-issue)
-              change '.issues[0].body = "<!-- dependency-security-issue:v1 -->" |
-                .jobs[0].completed_at = "2026-11-06T22:28:00Z"' ;;
+            source-only)
+              change '.issues[0].body = "<!-- dependency-security-issue:v1 -->\n<!-- dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:123 -->"' ;;
+            legacy-order)
+              change '.issues[0].body = "<!-- dependency-security-issue:v1 -->\n<!-- dependency-security-run:10:2 -->"' ;;
+            legacy-link)
+              change '.issues[0].body |= gsub("<!-- dependency-security-(source|run):[^>]+ -->"; "")' ;;
             closed-second-page)
               change '.issues = ([range(100) | {number: (100 + .), state: "open", body: "other", user: {login: "github-actions[bot]"}}] + .issues)' ;;
           esac
           resolved=$(jq -c '{issues, comments}' "$fixture")
-          GITHUB_RUN_ATTEMPT=3 invoke 0
+          GITHUB_RUN_ID=$report_id GITHUB_RUN_ATTEMPT=3 invoke 0
           check "{issues, comments} == $resolved"
           check 'all(.requests[]; .method == "GET")'
         done
-        echo 'PASS 17: closed issues suppress stale and report-only replay'
+        echo 'PASS 17: closed issues suppress the same scan identity and older runs'
 
-        # 요청: 종료 후 같은 실행의 새 취약점 검사 또는 이후 정기 검사. 기대: 닫힌 기록 보존, 새 이슈/댓글 1건.
-        for scenario in rescan next-schedule legacy-rescan; do
+        # 요청: 종료 후 다음 정기 실행에서 같은 커밋 또는 새 커밋의 취약점 발견. 기대: 새 이슈/멘션 1건.
+        for scenario in same-commit new-commit legacy-issue; do
           reset; invoke 0
-          change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T01:00:00Z"'
-          if [ "$scenario" = legacy-rescan ]; then
+          change '.issues[0].state = "closed"'
+          if [ "$scenario" = legacy-issue ]; then
             change '.issues[0].body = "<!-- dependency-security-issue:v1 -->"'
           fi
           resolved=$(jq -c .issues[0] "$fixture")
-          change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 | .completed_at = "2026-11-07T02:00:00Z")]'
-          if [ "$scenario" = next-schedule ]; then
-            change '.run.run_number += 1'
+          change '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .jobs[0].run_attempt = 1'
+          if [ "$scenario" = new-commit ]; then
+            change '.run.head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
           fi
-          GITHUB_RUN_ATTEMPT=3 invoke 0
+          GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=1 invoke 0
           check "(.issues | length) == 2 and .issues[0] == $resolved and .issues[1].state == \"open\" and
             (.comments | length) == 2 and .comments[1].issue_number == 43"
         done
-        echo 'PASS 18: new finding scans create a fresh issue after closure'
+        echo 'PASS 18: new scheduled runs report unresolved findings even at the same commit'
 
-        # 요청: 종료 전·동시·이후 완료된 검사를 늦게 보고. 기대: 종료 이후 재확인한 경우에만 새 이슈/멘션 생성.
-        for source in next-schedule rescan; do
-          for completed in 00:59 01:00 01:01; do
+        # 요청: 다음 정기 실행의 검사 완료 전·동시·후에 이전 이슈를 닫음. 기대: 실행 ID가 다른 새 정기 검사를 모두 보고.
+        for commit in same new; do
+          for completed in 22:34 22:35 22:36; do
             reset; invoke 0
-            change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T01:00:00Z" | .requests = []'
-            resolved=$(jq -c '{issues, comments}' "$fixture")
-            change --arg completed "$completed" '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 |
-              .completed_at = ("2026-11-07T" + $completed + ":00Z"))]'
-            if [ "$source" = next-schedule ]; then
-              change '.run.run_number += 1'
+            change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T22:35:00Z" | .requests = []'
+            resolved=$(jq -c .issues[0] "$fixture")
+            change --arg completed "$completed" '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .jobs[0].id = 2 | .jobs[0].run_attempt = 1 |
+              .jobs[0].completed_at = ("2026-11-07T" + $completed + ":00Z")'
+            if [ "$commit" = new ]; then
+              change '.run.head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
             fi
-            GITHUB_RUN_ATTEMPT=4 invoke 0
-            if [ "$completed" = 01:01 ]; then
-              check '(.issues | length) == 2 and .issues[0].state == "closed" and .issues[1].state == "open" and
-                (.comments | length) == 2 and .comments[1].issue_number == 43'
-            else
-              check "{issues, comments} == $resolved"
-              check 'all(.requests[]; .method == "GET")'
-            fi
+            GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=1 invoke 0
+            check "(.issues | length) == 2 and .issues[0] == $resolved and .issues[1].state == \"open\" and
+              (.comments | length) == 2 and .comments[1].issue_number == 43"
           done
         done
-        echo 'PASS 19: delayed reports respect closure time for marked issues'
+        echo 'PASS 19: closure timestamps cannot suppress a new scheduled scan'
