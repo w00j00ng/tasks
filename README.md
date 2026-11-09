@@ -92,6 +92,9 @@ workflow 수준에서도 정기 검사와 push·수동 실행의 동시 실행 �
 
 ## 검증
 
+테스트 구현은 `Taskfile.test.yml`에 두고 루트 `Taskfile.yml`에서 포함합니다.
+공통 저장소와 소비 저장소의 루트에서 `task security:test`로 실행합니다.
+
 ```sh
 task security:test
 ```

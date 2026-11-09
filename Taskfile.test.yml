@@ -1,0 +1,430 @@
+version: '3'
+
+tasks:
+  security:test:
+    desc: Verify security reporting and scanner classification without GitHub access
+    cmds:
+      - |
+        set -euo pipefail
+        tmp=$(mktemp -d -p . .security-test.XXXXXXXX)
+        fixture="$tmp/state.json"
+        log="$tmp/log"
+        trap 'rm -f "$fixture" "$log"; rmdir "$tmp"' EXIT
+        export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
+        export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
+        export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
+        export GH_TOKEN=test-token
+        reset() {
+          jq -n '{run: {run_number: 10, event: "schedule", head_branch: "main", head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            created_at: "2026-11-06T22:23:00Z"}, jobs: [{id: 1, run_attempt: 2, name: "dependency-scan (bcrypter)", status: "completed",
+            conclusion: "failure", html_url: "https://github.com/w00j00ng/goproj/actions/runs/123/job/bcrypter",
+            steps: [{name: "Fail for reachable vulnerabilities", conclusion: "failure"}]}],
+            issues: [], comments: [], requests: [], fail_method: "", fail_path: ""}' > "$fixture"
+        }
+        change() {
+          updated=$(jq "$@" "$fixture")
+          printf '%s\n' "$updated" > "$fixture"
+        }
+        check() {
+          jq -e "$1" "$fixture" > /dev/null || { printf 'FAIL: %s\n' "$1"; cat "$fixture"; cat "$log"; exit 1; }
+        }
+        # gh is the API boundary; unexpected requests fail instead of reaching GitHub.
+        gh() {
+          endpoint=${2#"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/"}
+          method=$4
+          change --arg method "$method" --arg path "$endpoint" '.requests += [{method: $method, path: $path}]'
+          if jq -e --arg method "$method" --arg path "$endpoint" \
+            '.fail_method == $method and (.fail_path == "" or .fail_path == $path)' "$fixture" > /dev/null; then
+            printf 'HTTP Error 503\n' >&2
+            return 1
+          fi
+          case "$method $endpoint" in
+            'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100'|'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100'|'GET issues/'*'/comments')
+              for option in --paginate --slurp; do
+                case " $* " in
+                  *" $option "*) ;;
+                  *) printf 'Missing API option: %s\n' "$option" >&2; return 1 ;;
+                esac
+              done ;;
+          esac
+          case "$method $endpoint" in
+            'GET actions/runs/'"$GITHUB_RUN_ID") jq .run "$fixture" ;;
+            'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100')
+              jq '[range(0; (.jobs | length); 100) as $i | {jobs: .jobs[$i:$i+100]}]' "$fixture" ;;
+            'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100')
+              jq '.issues | [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
+            'GET issues/'*'/comments')
+              number=${endpoint#issues/}; number=${number%/comments}
+              jq --argjson number "$number" '[.comments[] | select(.issue_number == $number)] |
+                [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
+            'POST issues')
+              payload=$(cat)
+              change --argjson payload "$payload" '.issues += [($payload + {number: (([.issues[].number,41] | max) + 1),
+                state: "open", user: {login: "github-actions[bot]"}})]'
+              jq '.issues[-1]' "$fixture" ;;
+            'PATCH issues/'*)
+              number=${endpoint#issues/}; payload=$(cat)
+              if jq -e --argjson number "$number" '.close_before_patch == $number' "$fixture" > /dev/null; then
+                change --argjson number "$number" '(.issues[] | select(.number == $number)).state = "closed" | .close_before_patch = null'
+              fi
+              if jq -e --argjson payload "$payload" '.fail_finalize == true and
+                ($payload.body | contains("<!-- dependency-security-pending:") | not)' "$fixture" > /dev/null; then
+                printf 'HTTP Error 503\n' >&2
+                return 1
+              fi
+              change --argjson number "$number" --argjson payload "$payload" \
+                '(.issues[] | select(.number == $number)) += $payload'
+              jq --argjson number "$number" '.issues[] | select(.number == $number)' "$fixture" ;;
+            'POST issues/'*'/comments')
+              number=${endpoint#issues/}; number=${number%/comments}; payload=$(cat)
+              change --argjson number "$number" --argjson payload "$payload" \
+                '.comments += [($payload + {issue_number: $number, user: {login: "github-actions[bot]"}})]'
+              printf '{}\n' ;;
+            *) printf 'Unexpected API request: %s %s\n' "$method" "$endpoint" >&2; return 1 ;;
+          esac
+        }
+        report() {
+        {{.SECURITY_REPORT | indent 2}}
+        }
+        invoke() {
+          expected=$1
+          set +e
+          (set +u; set +o pipefail; set -e; report) > "$log" 2>&1
+          result=$?
+          set -e
+          if [ "$result" -ne "$expected" ]; then
+            cat "$log"
+            cat "$fixture"
+            printf 'Expected exit %s; got %s\n' "$expected" "$result"
+            exit 1
+          fi
+        }
+        # 요청: main 정기 취약점 발견 + 다른 모듈 오류. 기대: 이슈/멘션 1건, 모듈·커밋·로그와 판정 불가 표시.
+        reset
+        change '.jobs += [(.jobs[0] | .name = "dependency-scan (scrypter)" | .steps[0].conclusion = "skipped")]'
+        invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | contains("dependency-security-issue:v1") and
+          contains("dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:123") and contains("bcrypter") and
+          contains("/job/bcrypter") and contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") and contains("scrypter")) and
+          (.comments[0].body | contains("@w00j00ng") and contains("2026-11-07"))'
+        echo 'PASS 1: finding creates one issue and one mention'
+
+        # 요청: 같은 날 재실행 후 다음 날 발견. 기대: 동일 이슈 최신화, 날짜별 댓글 1건.
+        reset; invoke 0
+        change '.jobs[0].name = "dependency-scan (helloworld)"'
+        invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | contains("helloworld") and (contains("dependency-scan (bcrypter)") | not) and
+          (contains("검사 오류") | not))'
+        change '.run.created_at = "2026-11-07T22:23:00Z" | .run.run_number += 1'
+        GITHUB_RUN_ID=124 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 2 and
+          (.issues[0].body | contains("dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:124"))'
+        echo 'PASS 2: unresolved findings notify again on the next scheduled date'
+
+        # 요청: 기존 이슈 닫은 뒤 발견. 기대: 닫힌 기록 보존, 새 이슈/댓글 생성.
+        reset; invoke 0
+        change '.issues[0].state = "closed"'
+        closed=$(jq -c .issues[0] "$fixture")
+        change '.run.run_number += 1'
+        GITHUB_RUN_ID=124 invoke 0
+        check "(.issues | length) == 2 and .issues[0] == $closed and .issues[1].number == 43 and
+          .issues[1].state == \"open\" and (.comments | length) == 2 and .comments[1].issue_number == 43"
+        echo 'PASS 3: closed issue preserved'
+
+        # 요청: 정상·분석 오류·취소. 기대: 이슈/댓글 쓰기 없음.
+        for conclusion in success failure cancelled; do
+          reset
+          change --arg conclusion "$conclusion" '.jobs[0].conclusion = $conclusion | .jobs[0].steps[0].conclusion = "skipped"'
+          invoke 0
+          check '(.issues | length) == 0 and (.comments | length) == 0 and all(.requests[]; .method == "GET")'
+        done
+        echo 'PASS 4: clean scans and execution errors excluded'
+
+        # 요청: PR·수동·push·다른 브랜치. 기대: API 호출 없음.
+        for event in pull_request workflow_dispatch push; do
+          reset
+          GITHUB_EVENT_NAME=$event invoke 0
+          check '(.requests | length) == 0'
+        done
+        reset
+        GITHUB_REF=refs/heads/feature invoke 0
+        check '(.requests | length) == 0'
+        echo 'PASS 5: events and branches excluded'
+
+        # 요청: 이슈/당일 댓글이 두 번째 페이지에 존재. 기대: 재사용, 중복 생성 없음.
+        reset; invoke 0
+        change '.jobs = ([range(100) | {id: (100 + .), run_attempt: 2, name: ("dependency-scan (clean-" + tostring + ")"),
+            status: "completed", conclusion: "success", steps: []}] + .jobs) |
+          .issues = ([range(100) | {number: (100 + .), state: "open", body: "other", user: {login: "github-actions[bot]"}}] + .issues) |
+          .comments = ([range(100) | {issue_number: 42, body: "other", user: {login: "github-actions[bot]"}}] + .comments)'
+        invoke 0
+        check '(.issues | length) == 101 and (.comments | length) == 101'
+        echo 'PASS 6: paginated issues and comments'
+
+        # 요청: 환경변수와 실제 실행 정보 불일치. 기대: 이슈/댓글 쓰기 없음.
+        for field in event head_branch; do
+          reset
+          change --arg field "$field" '.run[$field] = "other"'
+          invoke 0
+          check '(.issues | length) == 0 and (.comments | length) == 0 and all(.requests[]; .method == "GET")'
+        done
+        echo 'PASS 7: run metadata checked'
+
+        # 요청: 본문 갱신 API 실패. 기대: 작업 실패, 알림 댓글 없음.
+        reset; invoke 0
+        change '.comments = [] | .fail_method = "PATCH"'
+        invoke 1
+        check '(.comments | length) == 0'
+        grep -q 'HTTP Error 503' "$log"
+        if grep -q "$GH_TOKEN" "$log"; then echo 'Token leaked to log'; exit 1; fi
+        echo 'PASS 8: update failure prevents notification'
+
+        # 요청: 이슈 생성 후 댓글 실패, 재실행. 기대: 이슈 재사용, 댓글 1건.
+        reset
+        change '.fail_method = "POST" | .fail_path = "issues/42/comments"'
+        invoke 1
+        check '(.issues | length) == 1 and (.comments | length) == 0'
+        grep -q 'HTTP Error 503' "$log"
+        change '.fail_method = ""'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1'
+        echo 'PASS 9: report-only retry reuses previous scan and issue'
+
+        # 요청: 검사 종료 0·1·2·3·127. 기대: CI에서 3만 취약점 표시, 로컬에서는 원래 종료값 유지.
+        scan() {
+        {{.SECURITY_SCAN | indent 2}}
+        }
+        govulncheck() { return "$scanner_status"; }
+        for scanner_status in 0 1 2 3 127; do
+          for mode in ci local; do
+            : > "$log"
+            if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$log"; else unset GITHUB_OUTPUT; fi
+            set +e
+            (set -e; scan)
+            result=$?
+            set -e
+            expected=$scanner_status
+            if [ "$mode" = ci ] && [ "$scanner_status" -eq 3 ]; then
+              expected=0
+              grep -qx 'vulnerable=true' "$log"
+            else
+              test ! -s "$log"
+            fi
+            test "$result" -eq "$expected"
+          done
+        done
+        echo 'PASS 10: scanner classification'
+
+        # 요청: npm 정상/취약점/레지스트리 오류/잘못된 응답. 기대: high·critical만 발견 표시, 오류는 알림 제외.
+        scan_npm() {
+        {{.SECURITY_NPM | indent 2}}
+        }
+        npm() {
+          test "$*" = 'audit --package-lock-only --include=dev --audit-level=high --registry=https://registry.npmjs.org --json'
+          printf '%s' "$npm_response"
+          return "$npm_status"
+        }
+        for scenario in clean moderate high critical registry malformed other-error; do
+          npm_status=0; count=0
+          npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":0}}}'
+          case "$scenario" in
+            moderate) npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":0,"moderate":2}}}' ;;
+            high) npm_status=1; count=1; npm_response='{"metadata":{"vulnerabilities":{"high":1,"critical":0}}}' ;;
+            critical) npm_status=1; count=1; npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":1}}}' ;;
+            registry) npm_status=1; npm_response='{"error":{"code":"E503"}}' ;;
+            malformed) npm_response='not json' ;;
+            other-error) npm_status=2 ;;
+          esac
+          for mode in ci local; do
+            : > "$log"
+            if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$log"; else unset GITHUB_OUTPUT; fi
+            set +e
+            (set -e; scan_npm) > "$fixture" 2>&1
+            result=$?
+            set -e
+            if [ "$count" -gt 0 ] && [ "$mode" = ci ]; then
+              test "$result" -eq 0
+              grep -qx 'vulnerable=true' "$log"
+            else
+              test ! -s "$log"
+              case "$scenario" in
+                clean|moderate) test "$result" -eq 0 ;;
+                *) test "$result" -ne 0 ;;
+              esac
+            fi
+          done
+        done
+        echo 'PASS 11: npm severity and infrastructure errors'
+
+        # 요청: 다른 저장소의 npm 검사 취약점. 기대: 해당 저장소의 이슈와 실행 링크를 사용.
+        unset GITHUB_OUTPUT
+        reset
+        change '.jobs[0].name = "dependency-scan (npm)"'
+        GITHUB_REPOSITORY=w00j00ng/glorycourse invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | contains("dependency-scan (npm)")) and
+          (.comments[0].body | contains("w00j00ng/glorycourse/actions/runs/123"))'
+        echo 'PASS 12: consumer repository isolation'
+
+        # 요청: 소비 저장소에서 API 읽기 실패. 기대: 실패를 전파하고 이슈/댓글 중복 생성 없음.
+        for read_endpoint in 'actions/runs/123/jobs?filter=all&per_page=100' 'issues?state=all&creator=github-actions%5Bbot%5D&per_page=100' 'issues/42/comments'; do
+          reset; invoke 0
+          change --arg endpoint "$read_endpoint" '.fail_method = "GET" | .fail_path = $endpoint'
+          invoke 1
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            ([.requests[] | select(.method == "POST")] | length) == 2'
+        done
+        echo 'PASS 13: API read failures cannot create duplicates'
+
+        # 요청: 일부 모듈만 재검사하여 기존 실패가 성공으로 바뀜. 기대: 모듈별 최종 결과만 보고.
+        reset
+        change '.jobs += [(.jobs[0] | .name = "dependency-scan (scrypter)" | .id = 2),
+          (.jobs[0] | .run_attempt = 3 | .id = 3 | .conclusion = "success" | .steps[0].conclusion = "skipped")]'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues[0].body | contains("dependency-scan (scrypter)")) and
+          (.issues[0].body | contains("dependency-scan (bcrypter)") | not)'
+        reset
+        change '.jobs += [(.jobs[0] | .run_attempt = 3 | .id = 3 | .conclusion = "success" | .steps[0].conclusion = "skipped")]'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 0 and (.comments | length) == 0'
+        echo 'PASS 14: latest result per module supersedes old attempts'
+
+        # 요청: 최신 보고 뒤 이전 실행 또는 이전 시도가 늦게 도착. 기대: 본문/댓글 쓰기 없음.
+        for previous in run attempt; do
+          reset; invoke 0
+          latest=$(jq -c '{issues, comments}' "$fixture")
+          if [ "$previous" = run ]; then
+            change '.run.run_number = 9'
+            GITHUB_RUN_ATTEMPT=99 invoke 0
+          else
+            change '.jobs[0].run_attempt = 1'
+            GITHUB_RUN_ATTEMPT=1 invoke 0
+          fi
+          check "{issues, comments} == $latest"
+          check '([.requests[] | select(.method != "GET")] | length) == 2'
+        done
+        reset; invoke 0
+        change '.jobs += [(.jobs[0] | .run_attempt = 3 | .id = 3 | .name = "dependency-scan (helloworld)")]'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues[0].body | contains("dependency-security-run:10:3") and contains("helloworld")) and (.comments | length) == 1'
+        change '.run.run_number = 11'
+        GITHUB_RUN_ID=124 invoke 0
+        check '(.issues[0].body | contains("dependency-security-run:11:2"))'
+        echo 'PASS 15: stale reports cannot overwrite newer results'
+
+        # 요청: 순서 마커가 없는 기존 열린 이슈. 기대: 같은 이슈를 갱신하고 순서 마커 추가.
+        reset; invoke 0
+        change '.issues[0].body = "<!-- dependency-security-issue:v1 -->"'
+        invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | contains("dependency-security-run:10:2"))'
+        echo 'PASS 16: existing issues migrate without duplication'
+
+
+        # 요청: 닫힌 이슈에 보고한 실행의 재시도와 과거 실행. 기대: 새 이슈/댓글 없음.
+        for scenario in older-run report-only rescan clean-module-only source-only legacy-order legacy-link closed-second-page; do
+          reset; invoke 0
+          change '.issues[0].state = "closed" | .requests = []'
+          report_id=123
+          case "$scenario" in
+            older-run) change '.run.run_number = 9'; report_id=122 ;;
+            rescan)
+              change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 | .completed_at = "2026-11-07T02:00:00Z")]' ;;
+            clean-module-only)
+              change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 | .name = "dependency-scan (scrypter)" |
+                .conclusion = "success" | .steps[0].conclusion = "skipped")]' ;;
+            source-only)
+              change '.issues[0].body = "<!-- dependency-security-issue:v1 -->\n<!-- dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:123 -->"' ;;
+            legacy-order)
+              change '.issues[0].body = "<!-- dependency-security-issue:v1 -->\n<!-- dependency-security-run:10:2 -->"' ;;
+            legacy-link)
+              change '.issues[0].body |= gsub("<!-- dependency-security-(source|run):[^>]+ -->"; "")' ;;
+            closed-second-page)
+              change '.issues = ([range(100) | {number: (100 + .), state: "open", body: "other", user: {login: "github-actions[bot]"}}] + .issues)' ;;
+          esac
+          resolved=$(jq -c '{issues, comments}' "$fixture")
+          GITHUB_RUN_ID=$report_id GITHUB_RUN_ATTEMPT=3 invoke 0
+          check "{issues, comments} == $resolved"
+          check 'all(.requests[]; .method == "GET")'
+        done
+        echo 'PASS 17: closed issues suppress the same scan identity and older runs'
+
+        # 요청: 종료 후 다음 정기 실행에서 같은 커밋 또는 새 커밋의 취약점 발견. 기대: 새 이슈/멘션 1건.
+        for scenario in same-commit new-commit legacy-issue; do
+          reset; invoke 0
+          change '.issues[0].state = "closed"'
+          if [ "$scenario" = legacy-issue ]; then
+            change '.issues[0].body = "<!-- dependency-security-issue:v1 -->"'
+          fi
+          resolved=$(jq -c .issues[0] "$fixture")
+          change '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .jobs[0].run_attempt = 1'
+          if [ "$scenario" = new-commit ]; then
+            change '.run.head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+          fi
+          GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=1 invoke 0
+          check "(.issues | length) == 2 and .issues[0] == $resolved and .issues[1].state == \"open\" and
+            (.comments | length) == 2 and .comments[1].issue_number == 43"
+        done
+        echo 'PASS 18: new scheduled runs report unresolved findings even at the same commit'
+
+        # 요청: 다음 정기 실행의 검사 완료 전·동시·후에 이전 이슈를 닫음. 기대: 실행 ID가 다른 새 정기 검사를 모두 보고.
+        for commit in same new; do
+          for completed in 22:34 22:35 22:36; do
+            reset; invoke 0
+            change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T22:35:00Z" | .requests = []'
+            resolved=$(jq -c .issues[0] "$fixture")
+            change --arg completed "$completed" '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .jobs[0].id = 2 | .jobs[0].run_attempt = 1 |
+              .jobs[0].completed_at = ("2026-11-07T" + $completed + ":00Z")'
+            if [ "$commit" = new ]; then
+              change '.run.head_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+            fi
+            GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=1 invoke 0
+            check "(.issues | length) == 2 and .issues[0] == $resolved and .issues[1].state == \"open\" and
+              (.comments | length) == 2 and .comments[1].issue_number == 43"
+          done
+        done
+        echo 'PASS 19: closure timestamps cannot suppress a new scheduled scan'
+
+        # 요청: 다음 검사 보고 중 이슈 종료 또는 API 실패 후 재시도. 기대: 열린 이슈에 결과/멘션 복구, 같은 검사 중복 없음.
+        for scenario in closed-during-update create-failure finalize-failure closed-after-failure; do
+          reset; invoke 0
+          change '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z"'
+          case "$scenario" in
+            closed-during-update) change '.close_before_patch = 42' ;;
+            create-failure) change '.close_before_patch = 42 | .fail_method = "POST" | .fail_path = "issues"' ;;
+            finalize-failure|closed-after-failure) change '.fail_finalize = true' ;;
+          esac
+          expected=1
+          if [ "$scenario" = closed-during-update ]; then expected=0; fi
+          GITHUB_RUN_ID=124 invoke "$expected"
+          if [ "$scenario" != closed-during-update ]; then
+            check '(.issues | length) == 1 and (.comments | length) == 1'
+            change '.fail_method = "" | .fail_finalize = false'
+            if [ "$scenario" = closed-after-failure ]; then change '.issues[0].state = "closed"'; fi
+            GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=3 invoke 0
+          fi
+          check '([.issues[] | select(.state == "open")] | length) == 1 and
+            (.comments | length) == 2 and
+            (.issues[] | select(.state == "open") | .body |
+              contains("dependency-security-source:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:124") and
+              (contains("dependency-security-pending:") | not)) and
+            .comments[1].issue_number == ([.issues[] | select(.state == "open")][0].number)'
+          GITHUB_RUN_ID=124 GITHUB_RUN_ATTEMPT=4 invoke 0
+          check '([.issues[] | select(.state == "open")] | length) == 1 and (.comments | length) == 2'
+          if [ "$scenario" != finalize-failure ]; then
+            change '.run.run_number = 10 | .requests = []'
+            GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=5 invoke 0
+            check 'all(.requests[]; .method == "GET")'
+          fi
+        done
+        echo 'PASS 20: concurrent closure and partial failures recover without duplicate alerts'
+
+        # 요청: 이미 보고한 같은 실행의 재시도 도중 이슈 종료. 기대: 새 이슈/멘션 없이 종료 상태 유지.
+        reset; invoke 0
+        change '.close_before_patch = 42 | .requests = []'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 1 and .issues[0].state == "closed" and (.comments | length) == 1 and
+          all(.requests[]; .method != "POST")'
+        echo 'PASS 21: closing an already reported retry cannot create a duplicate issue'
