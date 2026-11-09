@@ -87,8 +87,8 @@ vars:
       ($findings | map(.completed_at // "") | max) as $completed |
       any(.[] | select(.state == "closed");
         [(.body | scan("<!-- dependency-security-run:([0-9]+):([0-9]+) -->")) | map(tonumber)] as $orders |
-        if ($orders | length) > 0 then any($orders[]; . >= [$run, $scan_attempt])
-        else $completed != "" and .closed_at != null and .closed_at >= $completed end) | tostring')
+        any($orders[]; . >= [$run, $scan_attempt]) or
+        ($completed != "" and .closed_at != null and .closed_at >= $completed)) | tostring')
     if [ "$replayed" = true ]; then
       exit 0
     fi
@@ -479,3 +479,26 @@ tasks:
             (.comments | length) == 2 and .comments[1].issue_number == 43"
         done
         echo 'PASS 18: new finding scans create a fresh issue after closure'
+
+        # 요청: 종료 전·동시·이후 완료된 검사를 늦게 보고. 기대: 종료 이후 재확인한 경우에만 새 이슈/멘션 생성.
+        for source in next-schedule rescan; do
+          for completed in 00:59 01:00 01:01; do
+            reset; invoke 0
+            change '.issues[0].state = "closed" | .issues[0].closed_at = "2026-11-07T01:00:00Z" | .requests = []'
+            resolved=$(jq -c '{issues, comments}' "$fixture")
+            change --arg completed "$completed" '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3 |
+              .completed_at = ("2026-11-07T" + $completed + ":00Z"))]'
+            if [ "$source" = next-schedule ]; then
+              change '.run.run_number += 1'
+            fi
+            GITHUB_RUN_ATTEMPT=4 invoke 0
+            if [ "$completed" = 01:01 ]; then
+              check '(.issues | length) == 2 and .issues[0].state == "closed" and .issues[1].state == "open" and
+                (.comments | length) == 2 and .comments[1].issue_number == 43'
+            else
+              check "{issues, comments} == $resolved"
+              check 'all(.requests[]; .method == "GET")'
+            fi
+          done
+        done
+        echo 'PASS 19: delayed reports respect closure time for marked issues'

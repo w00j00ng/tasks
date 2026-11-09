@@ -54,7 +54,8 @@ Go는 종료 코드 3, npm은 유효한 audit JSON의 high·critical 개수를 �
 보고 job은 전체 검사가 끝난 뒤 `task security:report`를 호출합니다. workflow에서
 `schedule`, `refs/heads/main`, 검사 실패 조건을 적용하고, job에 `contents: read`,
 `actions: read`, `issues: write`를 부여하세요. `GH_TOKEN: ${{ github.token }}`을 전달하고
-`dependency-security-issue` 동시 실행 그룹에서 `cancel-in-progress: false`로 직렬화합니다.
+`dependency-security-issue` 동시 실행 그룹에서 `cancel-in-progress: false`와 `queue: max`로
+직렬화합니다. 대기 중인 보고는 최대 100건까지 보존합니다.
 workflow 수준에서도 정기 검사와 push·수동 실행의 동시 실행 그룹을 분리해 정기 보고가
 취소되지 않게 하세요. 정기 실행은 workflow 그룹에 `github.run_id`를 사용해 과거 정기
 실행의 재시도와도 분리합니다. workflow의 정기 일정은 default branch에 병합한 뒤 동작합니다.
@@ -71,7 +72,8 @@ workflow 수준에서도 정기 검사와 push·수동 실행의 동시 실행 �
 - 닫힌 이슈는 보존합니다. 이후 새 검사에서 취약점이 발견되면 새 이슈를 만들며,
   동일한 취약점이 계속 발견되는 경우도 포함합니다.
 - 닫힌 이슈의 실행·시도 마커와 실제 취약점 검사 시도를 비교해 과거 보고와 보고 job만의
-  재시도는 건너뜁니다. 순서 마커가 없는 기존 이슈는 검사 완료 시각과 이슈 종료 시각을 비교합니다.
+  재시도는 건너뜁니다. 모든 닫힌 이슈에서 검사 완료 시각과 이슈 종료 시각도 비교하여,
+  종료 이전이나 같은 시각에 완료된 결과의 지연 보고도 건너뜁니다.
 - 본문 갱신과 알림 댓글을 분리하며, 이슈마다 검사 날짜(KST)별 멘션 댓글을 1회 남깁니다.
 - 알림 대상은 `@w00j00ng`입니다. 이메일은 GitHub 참여·멘션·댓글 이메일 설정을 따릅니다.
 - 정상 검사는 이슈를 자동 종료하지 않습니다. 조치 후 닫아 주세요. 마커는 유지하세요.
