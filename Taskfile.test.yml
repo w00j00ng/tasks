@@ -2,6 +2,7 @@ version: '3'
 
 tasks:
   security:test:
+    dir: '{{.ROOT_DIR}}'
     desc: Verify security reporting and scanner classification without GitHub access
     cmds:
       - |
