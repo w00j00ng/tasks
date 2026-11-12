@@ -242,7 +242,7 @@ tasks:
           command go "$@"
         }
         export SECURITY_RESULT_FILE="$tmp/result.json" SECURITY_SCAN_KEY=go-bcrypter-windows-cgo0 SECURITY_MODULE=bcrypter
-        for scenario in symbol package module clean strongest malformed empty config mode sbom null false function-type function-package package-type package-module version-module fixed-type; do
+        for scenario in symbol package module clean strongest malformed empty config mode sbom null false function-type function-package package-type package-module version-module fixed-type package-trace module-trace config-null config-false config-duplicate sbom-null sbom-false sbom-duplicate; do
           scanner_status=0
           jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
             {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$tmp/scanner.json"
@@ -257,6 +257,16 @@ tasks:
               fi ;;
             malformed) printf '{' >> "$tmp/scanner.json" ;;
             null|false) printf '{"finding":%s}\n' "$scenario" >> "$tmp/scanner.json" ;;
+            package-trace|module-trace)
+              jq -n --arg scenario "$scenario" '{finding: {osv: "GO-TEST-0001", trace: [
+                ({module: "example.com/dep", version: "v1.0.0"} +
+                  (if $scenario == "package-trace" then {package: "example.com/dep/pkg"} else {} end)),
+                {module: "example.com/app", package: "example.com/app", function: "Run"}]}}' >> "$tmp/scanner.json" ;;
+            config-*|sbom-*)
+              jq --arg scenario "$scenario" 'if ($scenario | startswith("config-")) then select(has("config")) else select(has("SBOM")) end |
+                if ($scenario | endswith("-null")) then map_values(null)
+                elif ($scenario | endswith("-false")) then map_values(false) else . end' "$tmp/scanner.json" > "$tmp/payload.json"
+              cat "$tmp/payload.json" >> "$tmp/scanner.json" ;;
             function-type|function-package|package-type|package-module|version-module|fixed-type)
               jq -n --arg scenario "$scenario" '{finding: {osv: "GO-TEST-0001", trace: [{module: "example.com/dep", version: "v1.0.0"}]}} |
                 if $scenario == "function-type" then .finding.trace[0] += {package: "example.com/dep/pkg", function: false}
@@ -284,7 +294,7 @@ tasks:
                 if [ "$mode" = ci ]; then
                   grep -qx 'vulnerable=true' "$log" || { cat "$tmp/scanner-output"; echo "FAIL: missing symbol CI output ($result)"; exit 1; }
                 else expected=3; fi ;;
-              malformed|empty|config|mode|sbom|null|false|function-type|function-package|package-type|package-module|version-module|fixed-type) expected=1; test ! -s "$log" ;;
+              malformed|empty|config|mode|sbom|null|false|function-type|function-package|package-type|package-module|version-module|fixed-type|package-trace|module-trace|config-*|sbom-*) expected=1; test ! -s "$log" ;;
               *) test ! -s "$log" ;;
             esac
             if [ "$result" -ne "$expected" ]; then echo "FAIL scanner $scenario/$mode: expected $expected got $result"; exit 1; fi
@@ -618,7 +628,7 @@ tasks:
         echo 'PASS 23: latest attempt is selected per full platform job name'
 
         # 요청: 최신 산출물이 없거나 만료·손상·다른 정체성. 기대: 실패, 과거 결과 대체·이슈 쓰기 없음.
-        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated function-type function-package package-type package-module version-module; do
+        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated function-type function-package package-type package-module version-module package-trace module-trace mixed-trace; do
           go_reset
           case "$scenario" in
             missing) change '.jobs += [(.jobs[0] | .id = 3 | .run_attempt = 3)]' ;;
@@ -644,6 +654,12 @@ tasks:
             package-type) change '.artifacts[0].result.findings[0] |= (.level = "module" | .traces[0][0].package = false)' ;;
             package-module) change '.artifacts[0].result.findings[0].traces[0] += [{package: "example.com/app"}]' ;;
             version-module) change '.artifacts[0].result.findings[0].traces[0] += [{version: "v1.0.0"}]' ;;
+            package-trace|module-trace|mixed-trace)
+              change --arg scenario "$scenario" '.artifacts[0].result.findings[0] |= (
+                .traces[0] += [{module: "example.com/app", package: "example.com/app", function: "Run"}] |
+                if $scenario == "module-trace" then .level = "module" | del(.traces[0][0].package)
+                elif $scenario == "mixed-trace" then .level = "symbol" | .traces += [(.traces[0] | .[0].function = "Unsafe")]
+                else . end)' ;;
           esac
           GITHUB_RUN_ATTEMPT=3 invoke 1
           check '(.issues | length) == 0 and (.comments | length) == 0'
@@ -754,3 +770,46 @@ tasks:
           check '(.issues | length) == 1 and (.comments | length) == 1'
         done
         echo 'PASS 29: legacy full-body recovery markers remain compatible'
+
+        # 요청: 같은 취약점의 호출 확인·import 전용 패키지와 모듈 근거. 기대: symbol 행에는 호출 확인 패키지만 표시하고 모든 근거 보존.
+        go_reset
+        jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+          {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}},
+          ({module: "example.com/dep", version: "v1.0.0"} as $frame |
+            ([$frame], [$frame + {package: "example.com/dep/imported"}],
+              [$frame + {package: "example.com/dep/called", function: "Unsafe"},
+                {module: "example.com/app", package: "example.com/app", function: "Run"}]) |
+            {finding: {osv: "GO-TEST-MIXED", trace: .}})' > "$tmp/scanner.json"
+        scanner_status=0
+        (export GITHUB_OUTPUT="$tmp/scanner-output" SECURITY_RESULT_FILE="$tmp/result.json"
+          export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SECURITY_SCAN_KEY=go-bcrypter-linux-cgo0 SECURITY_MODULE=bcrypter
+          export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
+          : > "$GITHUB_OUTPUT"
+          scan) > "$log" 2>&1
+        grep -qx 'vulnerable=true' "$tmp/scanner-output"
+        change --slurpfile result "$tmp/result.json" '.artifacts[0].result = $result[0] |
+          .jobs[0].conclusion = "failure" | .jobs[0].steps = [{name: "Fail for reachable vulnerabilities", conclusion: "failure"}]'
+        invoke 0
+        check '(.artifacts[0].result.findings | length) == 1 and
+          (.artifacts[0].result.findings[0] | .level == "symbol" and (.traces | length) == 3 and
+            (.packages | index("example.com/dep/imported") != null)) and
+          (.issues[0].body | contains("example.com/dep/called") and (contains("example.com/dep/imported") | not) and
+            (contains("example.com/app") | not))'
+        echo 'PASS 30: symbol reports list called packages and preserve weaker evidence in artifacts'
+
+        # 요청: 한글이 포함된 본문이 한도 직전의 행에서 잘림. 기대: 생성·갱신 본문은 안내와 로그 링크까지 UTF-8 60,000바이트 이하.
+        go_reset
+        change '.artifacts[0].result.findings = [range(80) as $i | .artifacts[0].result.findings[0] |
+          .osv = "GO-BUDGET-\(100 + $i)" | .fixed_version = "수정 버전 미제공"]'
+        invoke 0
+        padding=$(jq -j '.issues[0].body | split("\n") | reduce .[] as $line ({size: 0, done: false};
+          if .done then . else .size += ($line | utf8bytelength) + 1 |
+            .done = ($line | contains("| [GO-BUDGET-179]")) end) | 59950 - .size' "$fixture")
+        change --argjson padding "$padding" '.artifacts[0].result.findings[0] |=
+          (.module += ("x" * $padding) | .traces[0][0].module = .module) | .issues = [] | .comments = []'
+        invoke 0
+        check '.issues[0].body | utf8bytelength <= 60000 and contains("본문 길이 제한") and contains("actions/runs/123/attempts/2")'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | utf8bytelength <= 60000 and contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
+        echo 'PASS 31: truncated bodies include the notice within the UTF-8 budget'

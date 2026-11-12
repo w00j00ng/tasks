@@ -38,7 +38,7 @@ vars:
           ((.version // "") == "" or (.module | text)) and
           ((.package // "") == "" or (.module | text)) and
           ((.function // "") == "" or (.package | text));
-        if ([.[] | .config? // empty] | length) != 1 or ([.[] | .SBOM? // empty] | length) != 1 or
+        if ([.[] | select(has("config"))] | length) != 1 or ([.[] | select(has("SBOM"))] | length) != 1 or
           (all(.[]; type == "object" and (keys | length) == 1 and
             (has("config") or has("SBOM") or has("osv") or has("progress") or has("finding"))) | not) then
           error("incomplete govulncheck JSON") else . end |
@@ -52,7 +52,7 @@ vars:
           if type == "object" and (.osv | text) and (.trace | type == "array" and length > 0) and
             (.trace[0].module | text) and (.trace[0].version | text) and
             (.fixed_version == null or (.fixed_version | type == "string")) and
-            all(.trace[]; frame) then . else error("invalid finding") end |
+            all(.trace[]; frame) and (.trace | length == 1 or (.[0].function | text)) then . else error("invalid finding") end |
           {osv, module: .trace[0].module, version: .trace[0].version, fixed_version: (.fixed_version // ""),
            level: (if (.trace[0].function // "") != "" then "symbol" elif (.trace[0].package // "") != "" then "package" else "module" end),
            packages: [.trace[] | .package? // empty | select(length > 0)], traces: [.trace]}] |
@@ -208,11 +208,13 @@ vars:
               (.packages | type == "array") and all(.packages[]; text) and
               (.traces | type == "array" and length > 0) and (. as $finding |
                 all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
-                  all(.[]; frame))) and
+                  all(.[]; frame) and (length == 1 or (.[0].function | text)))) and
               .level == evidence_level)' "$result_file" > /dev/null; then
           jq -c --argjson job "$job" '.target as $target | .findings[] |
             {osv, module, version, level, fixed_version, target: $target, job: ($job | {name, html_url}),
-             packages: ([.traces[][0].package | select(type == "string" and length > 0)] | unique)}' \
+             packages: ([. as $finding | .traces[][0] |
+               select($finding.level != "symbol" or (.function // "") != "") |
+               .package | select(type == "string" and length > 0)] | unique)}' \
             "$result_file" >> "$report_tmp/findings.jsonl"
           if ! jq -e --argjson job "$job" '$job.conclusion == "success" or ($job.conclusion == "failure" and
             $job.gate_failed and any(.findings[]; .level == "symbol"))' "$result_file" > /dev/null; then
@@ -276,12 +278,15 @@ vars:
       printf '\n%s\n%s\n' '검사 범위와 취약점 상세는 연결된 검사 로그를 확인해 주세요.' \
         '본문은 최근 발견 결과로 갱신하며 알림은 별도 댓글로 남깁니다. 조치 완료 후 이슈를 닫아 주세요. 이후 발견 시 새 이슈를 생성합니다.')
     # Reserve room for recovery metadata inside GitHub's 65,536-character body limit.
-    body=$(printf '%s' "$body" | jq -Rsj --arg url "$run_url" '
+    # Binary output keeps Windows newline conversion from exceeding the UTF-8 budget.
+    body=$(printf '%s' "$body" | jq -bRsj --arg url "$run_url" '
       if utf8bytelength <= 60000 then . else
+        "\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요." as $notice |
+        (60000 - ($notice | utf8bytelength)) as $limit |
         reduce split("\n")[] as $line ({body: "", full: false};
-          if .full then . elif ((.body | utf8bytelength) + ($line | utf8bytelength) + 1) <= 60000
+          if .full then . elif ((.body | utf8bytelength) + ($line | utf8bytelength) + 1) <= $limit
           then .body += $line + "\n" else .full = true end) |
-        .body + "\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요."
+        .body + $notice
       end')
     issues=$(api GET 'issues?state=all&creator=github-actions%5Bbot%5D&per_page=100' --paginate --slurp |
       jq --arg marker "$marker" --arg source "$source" --arg sha "$sha" \
