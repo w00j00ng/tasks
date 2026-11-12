@@ -281,7 +281,7 @@ vars:
     # Binary output keeps Windows newline conversion from exceeding the UTF-8 budget.
     body=$(printf '%s' "$body" | jq -bRsj --arg url "$run_url" '
       if utf8bytelength <= 60000 then . else
-        "\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요." as $notice |
+        ("\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요.") as $notice |
         (60000 - ($notice | utf8bytelength)) as $limit |
         reduce split("\n")[] as $line ({body: "", full: false};
           if .full then . elif ((.body | utf8bytelength) + ($line | utf8bytelength) + 1) <= $limit

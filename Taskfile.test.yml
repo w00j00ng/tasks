@@ -808,8 +808,10 @@ tasks:
         change --argjson padding "$padding" '.artifacts[0].result.findings[0] |=
           (.module += ("x" * $padding) | .traces[0][0].module = .module) | .issues = [] | .comments = []'
         invoke 0
-        check '.issues[0].body | utf8bytelength <= 60000 and contains("본문 길이 제한") and contains("actions/runs/123/attempts/2")'
+        check '.issues[0].body | utf8bytelength <= 60000 and startswith("<!-- dependency-security-issue:v1 -->") and
+          contains("본문 길이 제한") and contains("actions/runs/123/attempts/2")'
         GITHUB_RUN_ATTEMPT=3 invoke 0
         check '(.issues | length) == 1 and (.comments | length) == 1 and
-          (.issues[0].body | utf8bytelength <= 60000 and contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
+          (.issues[0].body | utf8bytelength <= 60000 and startswith("<!-- dependency-security-issue:v1 -->") and
+            contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
         echo 'PASS 31: truncated bodies include the notice within the UTF-8 budget'
