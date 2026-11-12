@@ -18,7 +18,7 @@ tasks:
         esac
         fixture="$tmp/state.json"
         log="$tmp/log"
-        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output"; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
+        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml"; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
         export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
@@ -319,28 +319,32 @@ tasks:
         unset SECURITY_RESULT_FILE SECURITY_SCAN_KEY SECURITY_MODULE
         # 요청: 소비 include의 중첩 MODULE에서 실제 스캔 작업 실행. 기대: 모듈 작업 디렉터리에 결과를 쓰고 임시 파일 정리.
         mkdir "$tmp/module"
-        test_module=$(printf '%s' "$tmp" | jq -Rj 'gsub("\\\\"; "/") | split("/")[-1]')/module
         export SECURITY_SCANNER_FIXTURE="$(cd "$tmp" && pwd)/scanner.json"
         jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
           {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$SECURITY_SCANNER_FIXTURE"
         scan_source={{.SECURITY_SCAN | shellQuote}}
         entry_scan='govulncheck() { cat "$SECURITY_SCANNER_FIXTURE"; }; '
-        task --silent --exit-code security:scan MODULE="$test_module" SECURITY_SCAN="$entry_scan$scan_source" > "$tmp/scanner-output"
+        # Included Taskfile vars override CLI globals; task-call vars keep this scanner stub local.
+        jq -n --arg source {{.TASKFILE_DIR | shellQuote}}/Taskfile.yml --arg scan "$entry_scan$scan_source" \
+          '{version: "3", silent: true, includes: {shared: {taskfile: $source, dir: ".", flatten: true}},
+            tasks: {entry: {cmds: [{task: "security:scan", vars: {MODULE: "module", SECURITY_SCAN: $scan}}]}}}' > "$tmp/Taskfile.entry.yml"
+        CGO_ENABLED=0 task --silent --exit-code --taskfile "$tmp/Taskfile.entry.yml" entry > "$tmp/scanner-output"
         jq -e '.scan_status == "complete" and .target.cgo == "0"' "$tmp/scanner-output" > /dev/null
         for leftover in "$tmp/module"/.security-scan.*; do
           if [ -d "$leftover" ]; then echo "Scanner temp directory leaked: $leftover"; exit 1; fi
         done
-        unset SECURITY_SCANNER_FIXTURE
         # 요청: 실제 Task 진입점의 명시 CGO 설정과 미설정. 기대: 0/1 상속, 기본값 0.
         for cgo in 0 1 default; do
           if [ "$cgo" = default ]; then
-            actual=$(unset CGO_ENABLED; task --silent security:scan MODULE=. SECURITY_SCAN='go env CGO_ENABLED')
-            test "$actual" = 0
+            actual=$(unset CGO_ENABLED; task --silent --taskfile "$tmp/Taskfile.entry.yml" entry)
+            expected_cgo=0
           else
-            actual=$(CGO_ENABLED=$cgo task --silent security:scan MODULE=. SECURITY_SCAN='go env CGO_ENABLED')
-            test "$actual" = "$cgo"
+            actual=$(CGO_ENABLED=$cgo task --silent --taskfile "$tmp/Taskfile.entry.yml" entry)
+            expected_cgo=$cgo
           fi
+          test "$(printf '%s' "$actual" | jq -j .target.cgo)" = "$expected_cgo"
         done
+        unset SECURITY_SCANNER_FIXTURE
         echo 'PASS 10: scanner classification'
 
         # 요청: npm 정상/취약점/레지스트리 오류/잘못된 응답. 기대: high·critical만 발견 표시, 오류는 알림 제외.
