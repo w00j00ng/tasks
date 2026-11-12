@@ -18,7 +18,7 @@ tasks:
         esac
         fixture="$tmp/state.json"
         log="$tmp/log"
-        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml"; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
+        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
         export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
@@ -91,27 +91,29 @@ tasks:
               jq --argjson number "$number" '[.comments[] | select(.issue_number == $number)] |
                 [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
             'POST issues')
-              payload=$(cat)
-              change --argjson payload "$payload" '.issues += [($payload + {number: (([.issues[].number,41] | max) + 1),
+              cat > "$tmp/payload.json"
+              jq -e '.body | length <= 65536' "$tmp/payload.json" > /dev/null || return 1
+              change --slurpfile payload "$tmp/payload.json" '.issues += [($payload[0] + {number: (([.issues[].number,41] | max) + 1),
                 state: "open", user: {login: "github-actions[bot]"}})]'
               jq '.issues[-1]' "$fixture" ;;
             'PATCH issues/'*)
-              number=${endpoint#issues/}; payload=$(cat)
+              number=${endpoint#issues/}; cat > "$tmp/payload.json"
+              jq -e '.body | length <= 65536' "$tmp/payload.json" > /dev/null || return 1
               if jq -e --argjson number "$number" '.close_before_patch == $number' "$fixture" > /dev/null; then
                 change --argjson number "$number" '(.issues[] | select(.number == $number)).state = "closed" | .close_before_patch = null'
               fi
-              if jq -e --argjson payload "$payload" '.fail_finalize == true and
-                ($payload.body | contains("<!-- dependency-security-pending:") | not)' "$fixture" > /dev/null; then
+              if jq -e --slurpfile payload "$tmp/payload.json" '.fail_finalize == true and
+                ($payload[0].body | contains("<!-- dependency-security-pending:") | not)' "$fixture" > /dev/null; then
                 printf 'HTTP Error 503\n' >&2
                 return 1
               fi
-              change --argjson number "$number" --argjson payload "$payload" \
-                '(.issues[] | select(.number == $number)) += $payload'
+              change --argjson number "$number" --slurpfile payload "$tmp/payload.json" \
+                '(.issues[] | select(.number == $number)) += $payload[0]'
               jq --argjson number "$number" '.issues[] | select(.number == $number)' "$fixture" ;;
             'POST issues/'*'/comments')
-              number=${endpoint#issues/}; number=${number%/comments}; payload=$(cat)
-              change --argjson number "$number" --argjson payload "$payload" \
-                '.comments += [($payload + {issue_number: $number, user: {login: "github-actions[bot]"}})]'
+              number=${endpoint#issues/}; number=${number%/comments}; cat > "$tmp/payload.json"
+              change --argjson number "$number" --slurpfile payload "$tmp/payload.json" \
+                '.comments += [($payload[0] + {issue_number: $number, user: {login: "github-actions[bot]"}})]'
               printf '{}\n' ;;
             *) printf 'Unexpected API request: %s %s\n' "$method" "$endpoint" >&2; return 1 ;;
           esac
@@ -240,7 +242,7 @@ tasks:
           command go "$@"
         }
         export SECURITY_RESULT_FILE="$tmp/result.json" SECURITY_SCAN_KEY=go-bcrypter-windows-cgo0 SECURITY_MODULE=bcrypter
-        for scenario in symbol package module clean strongest malformed empty config mode sbom null false; do
+        for scenario in symbol package module clean strongest malformed empty config mode sbom null false function-type function-package package-type package-module version-module fixed-type; do
           scanner_status=0
           jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
             {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$tmp/scanner.json"
@@ -255,6 +257,14 @@ tasks:
               fi ;;
             malformed) printf '{' >> "$tmp/scanner.json" ;;
             null|false) printf '{"finding":%s}\n' "$scenario" >> "$tmp/scanner.json" ;;
+            function-type|function-package|package-type|package-module|version-module|fixed-type)
+              jq -n --arg scenario "$scenario" '{finding: {osv: "GO-TEST-0001", trace: [{module: "example.com/dep", version: "v1.0.0"}]}} |
+                if $scenario == "function-type" then .finding.trace[0] += {package: "example.com/dep/pkg", function: false}
+                elif $scenario == "function-package" then .finding.trace[0].function = "Read"
+                elif $scenario == "package-type" then .finding.trace[0].package = false
+                elif $scenario == "package-module" then .finding.trace += [{package: "example.com/app"}]
+                elif $scenario == "version-module" then .finding.trace += [{version: "v1.0.0"}]
+                else .finding.fixed_version = false end' >> "$tmp/scanner.json" ;;
             empty) : > "$tmp/scanner.json" ;;
             config|mode|sbom)
               updated=$(jq --arg scenario "$scenario" 'if $scenario == "sbom" then select(has("SBOM") | not)
@@ -274,7 +284,7 @@ tasks:
                 if [ "$mode" = ci ]; then
                   grep -qx 'vulnerable=true' "$log" || { cat "$tmp/scanner-output"; echo "FAIL: missing symbol CI output ($result)"; exit 1; }
                 else expected=3; fi ;;
-              malformed|empty|config|mode|sbom|null|false) expected=1; test ! -s "$log" ;;
+              malformed|empty|config|mode|sbom|null|false|function-type|function-package|package-type|package-module|version-module|fixed-type) expected=1; test ! -s "$log" ;;
               *) test ! -s "$log" ;;
             esac
             if [ "$result" -ne "$expected" ]; then echo "FAIL scanner $scenario/$mode: expected $expected got $result"; exit 1; fi
@@ -608,7 +618,7 @@ tasks:
         echo 'PASS 23: latest attempt is selected per full platform job name'
 
         # 요청: 최신 산출물이 없거나 만료·손상·다른 정체성. 기대: 실패, 과거 결과 대체·이슈 쓰기 없음.
-        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated; do
+        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated function-type function-package package-type package-module version-module; do
           go_reset
           case "$scenario" in
             missing) change '.jobs += [(.jobs[0] | .id = 3 | .run_attempt = 3)]' ;;
@@ -629,6 +639,11 @@ tasks:
             traces) change '.artifacts[0].result.findings[0].traces = [[null]]' ;;
             overstated) change '.artifacts[0].result.findings[0].level = "symbol"' ;;
             understated) change '.artifacts[0].result.findings[0].traces[0][0].function = "Unsafe"' ;;
+            function-type) change '.artifacts[0].result.findings[0].traces[0][0].function = false' ;;
+            function-package) change '.artifacts[0].result.findings[0] |= (.level = "symbol" | .traces[0][0].function = "Read" | del(.traces[0][0].package))' ;;
+            package-type) change '.artifacts[0].result.findings[0] |= (.level = "module" | .traces[0][0].package = false)' ;;
+            package-module) change '.artifacts[0].result.findings[0].traces[0] += [{package: "example.com/app"}]' ;;
+            version-module) change '.artifacts[0].result.findings[0].traces[0] += [{version: "v1.0.0"}]' ;;
           esac
           GITHUB_RUN_ATTEMPT=3 invoke 1
           check '(.issues | length) == 0 and (.comments | length) == 0'
@@ -697,3 +712,45 @@ tasks:
             length == 1 and (.[0] | contains("golang.org/x/image/bmp") and contains("golang.org/x/image/tiff") and
               contains("go/bcrypter/windows-cgo0") and contains("go/scrypter/windows-cgo0")))'
         echo 'PASS 27: full Go matrix reports affected packages in one issue row'
+
+        # 요청: 28개 환경의 같은 경고 8/18건. 기대: 생성·갱신·복구가 본문 한도를 지키고 날짜별 한 번 알림.
+        jq '{jobs: [.jobs[] | .steps = []], artifacts}' "$fixture" > "$tmp/matrix.json"
+        for count in 8 18; do
+          change --argjson count "$count" --slurpfile matrix "$tmp/matrix.json" '
+            .jobs = $matrix[0].jobs | .artifacts = $matrix[0].artifacts |
+            .issues = [] | .comments = [] | .requests = [] |
+            .run.run_number = 10 | .run.created_at = "2026-11-06T22:23:00Z" | .fail_finalize = false |
+            .artifacts |= map(.workflow_run.id = 123 | .result.run_id = 123 |
+              .result.findings = [range($count) | {osv: "GO-TEST-\(.)", level: "module",
+              module: "stdlib", version: "v1.27.4", fixed_version: "v1.27.5", packages: [],
+              traces: [[{module: "stdlib", version: "v1.27.4"}]]}])'
+          invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            (.issues[0].body | length <= 65536 and contains("GO-TEST-") and contains("actions/runs/123"))'
+          if [ "$count" -gt 8 ]; then check '.issues[0].body | contains("본문 길이 제한")'; fi
+          # 큰 이전 본문에서 작은 새 결과로 바뀌어도 복구 마커가 본문 전체를 복제하면 갱신이 실패한다.
+          change '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .fail_finalize = true |
+            .jobs = [.jobs[0]] | .artifacts = [.artifacts[0]] |
+            .artifacts |= map(.workflow_run.id = 124 | .result.run_id = 124)'
+          GITHUB_RUN_ID=124 invoke 1
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            (.issues[0].body | length <= 65536) and
+            ([.issues[0].body | scan("<!-- dependency-security-pending:([A-Za-z0-9+/=]+) -->")][0][0] |
+              @base64d | length < 500)'
+          change '.fail_finalize = false'
+          GITHUB_RUN_ID=124 invoke 0
+          GITHUB_RUN_ID=124 invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 2 and
+            (.issues[0].body | length <= 65536 and (contains("dependency-security-pending:") | not))'
+        done
+        echo 'PASS 28: large reports create, update and recover within GitHub body limits'
+
+        # 요청: 예전 전체 본문 형식의 pending 마커. 기대: 열린 이슈 복구, 닫힌 동일 검사 재전송 억제.
+        for state in open closed; do
+          reset; invoke 0
+          change --arg state "$state" '.issues[0] |= (.body as $old |
+            .state = $state | .body += "\n<!-- dependency-security-pending:\($old | @base64) -->")'
+          invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 1'
+        done
+        echo 'PASS 29: legacy full-body recovery markers remain compatible'

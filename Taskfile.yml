@@ -32,6 +32,12 @@ vars:
     if [ "$status" -eq 0 ]; then
       if jq -se '
         def text: type == "string" and length > 0;
+        def frame:
+          type == "object" and
+          all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
+          ((.version // "") == "" or (.module | text)) and
+          ((.package // "") == "" or (.module | text)) and
+          ((.function // "") == "" or (.package | text));
         if ([.[] | .config? // empty] | length) != 1 or ([.[] | .SBOM? // empty] | length) != 1 or
           (all(.[]; type == "object" and (keys | length) == 1 and
             (has("config") or has("SBOM") or has("osv") or has("progress") or has("finding"))) | not) then
@@ -45,9 +51,8 @@ vars:
         [.[] | select(has("finding")) | .finding |
           if type == "object" and (.osv | text) and (.trace | type == "array" and length > 0) and
             (.trace[0].module | text) and (.trace[0].version | text) and
-            ((.fixed_version // "") | type == "string") and
-            all(.trace[]; type == "object" and ((.package // "") | type == "string") and
-              ((.function // "") | type == "string")) then . else error("invalid finding") end |
+            (.fixed_version == null or (.fixed_version | type == "string")) and
+            all(.trace[]; frame) then . else error("invalid finding") end |
           {osv, module: .trace[0].module, version: .trace[0].version, fixed_version: (.fixed_version // ""),
            level: (if (.trace[0].function // "") != "" then "symbol" elif (.trace[0].package // "") != "" then "package" else "module" end),
            packages: [.trace[] | .package? // empty | select(length > 0)], traces: [.trace]}] |
@@ -182,6 +187,12 @@ vars:
           jq -se --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
             --argjson attempt "$scan_attempt" --arg key "$scan_key" --arg module "$module" --arg os "$expected_os" --arg cgo "$expected_cgo" '
             def text: type == "string" and length > 0;
+            def frame:
+              type == "object" and
+              all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
+              ((.version // "") == "" or (.module | text)) and
+              ((.package // "") == "" or (.module | text)) and
+              ((.function // "") == "" or (.package | text));
             def evidence_level:
               if any(.traces[][0]; (.function // "") != "") then "symbol"
               elif any(.traces[][0]; (.package // "") != "") then "package"
@@ -197,7 +208,7 @@ vars:
               (.packages | type == "array") and all(.packages[]; text) and
               (.traces | type == "array" and length > 0) and (. as $finding |
                 all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
-                  all(.[]; type == "object" and ((.package // "") | type == "string") and ((.function // "") | type == "string")))) and
+                  all(.[]; frame))) and
               .level == evidence_level)' "$result_file" > /dev/null; then
           jq -c --argjson job "$job" '.target as $target | .findings[] |
             {osv, module, version, level, fixed_version, target: $target, job: ($job | {name, html_url}),
@@ -236,10 +247,18 @@ vars:
     marker='<!-- dependency-security-issue:v1 -->'
     run_number=$(printf '%s' "$run" | jq -je '.run_number | numbers | tostring')
     source="<!-- dependency-security-source:$sha:$GITHUB_RUN_ID -->"
+    errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
+      --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") | not) and
+        .conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] + $unknown | join(", ")')
     body=$(printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
       'main 정기 의존성 검사에서 보안 점검 결과가 발견되었습니다.' '' \
-      "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)" '' \
-      '### 호출 경로에서 확인된 Go 취약점' '' \
+      "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)"
+      printf '%s' "$go_findings" | jq -r '"- Go 보고 항목: 호출 경로 확인 \([.[] | select(.level == "symbol")] | length)건, 의존성 업데이트 경고 \([.[] | select(.level != "symbol")] | length)건"'
+      if [ -n "$errors" ]; then
+        printf '\n다음 모듈은 검사 오류로 판정 불가입니다: %s.\n' "$errors"
+      fi
+      printf '\n%s\n\n' '### 호출 경로에서 확인된 Go 취약점'
+      printf '%s\n' \
       '| OSV | 의존성 | 영향 패키지 | 발견 / 수정 버전 | 대상 | 검사 |' '| --- | --- | --- | --- | --- | --- |'
       printf '%s' "$go_findings" | jq -r '.[] | select(.level == "symbol") |
         "| [\(.osv)](https://osv.dev/vulnerability/\(.osv)) | \(.module) | \(.packages | join(", ")) | \(.version) / \(.fixed_versions | join(", ")) | \(.targets | map("\(.goos)/\(.goarch), cgo=\(.cgo)") | join("; ")) | \(.jobs | map("[\(.name)](\(.html_url))") | join("; ")) |"'
@@ -254,14 +273,16 @@ vars:
         '| 취약점 발견 모듈 | 상세 결과 |'
       printf '%s\n' '| --- | --- |'
       printf '%s' "$findings" | jq -r 'sort_by(.name)[] | "| \(.name) | [검사 결과](\(.html_url)) |"'
-      errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
-        --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") | not) and
-          .conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] + $unknown | join(", ")')
-      if [ -n "$errors" ]; then
-        printf '\n다음 모듈은 검사 오류로 판정 불가입니다: %s.\n' "$errors"
-      fi
       printf '\n%s\n%s\n' '검사 범위와 취약점 상세는 연결된 검사 로그를 확인해 주세요.' \
         '본문은 최근 발견 결과로 갱신하며 알림은 별도 댓글로 남깁니다. 조치 완료 후 이슈를 닫아 주세요. 이후 발견 시 새 이슈를 생성합니다.')
+    # Reserve room for recovery metadata inside GitHub's 65,536-character body limit.
+    body=$(printf '%s' "$body" | jq -Rsj --arg url "$run_url" '
+      if utf8bytelength <= 60000 then . else
+        reduce split("\n")[] as $line ({body: "", full: false};
+          if .full then . elif ((.body | utf8bytelength) + ($line | utf8bytelength) + 1) <= 60000
+          then .body += $line + "\n" else .full = true end) |
+        .body + "\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요."
+      end')
     issues=$(api GET 'issues?state=all&creator=github-actions%5Bbot%5D&per_page=100' --paginate --slurp |
       jq --arg marker "$marker" --arg source "$source" --arg sha "$sha" \
         --arg path "/actions/runs/$GITHUB_RUN_ID/" --argjson run "$run_number" '
@@ -286,14 +307,19 @@ vars:
     fi
     number=$(printf '%s' "$existing" | jq -j '.number // empty | tostring')
     if [ -n "$number" ]; then
-      # Keep the last completed report until GitHub confirms this update reached an open issue.
-      previous=$(printf '%s' "$existing" | jq -j '.reported | @base64')
-      issue=$(jq -n --arg body "$body" --arg previous "$previous" \
-        '{body: ($body + "\n<!-- dependency-security-pending:" + $previous + " -->")}' |
+      # Only scan identity is needed to recover an update interrupted by closure or API failure.
+      previous=$(printf '%s' "$existing" | jq -j '.reported | [
+        ([match("<!-- dependency-security-run:[0-9]+:[0-9]+ -->").string][0] // ""),
+        ([match("<!-- dependency-security-source:[0-9a-f]{40}:[0-9]+ -->").string][0] // ""),
+        ([match("[0-9a-f]{40}").string][0] // ""),
+        ([match("/actions/runs/[0-9]+/").string][0] // "")
+        ] | join("\n") | @base64')
+      issue=$(printf '%s' "$body" | jq -Rs --arg previous "$previous" \
+        '{body: (. + "\n<!-- dependency-security-pending:" + $previous + " -->")}' |
         api PATCH "issues/$number" --input -)
       state=$(printf '%s' "$issue" | jq -je '.state | select(. == "open" or . == "closed")')
       if [ "$state" = open ]; then
-        jq -n --arg body "$body" '{body: $body}' | api PATCH "issues/$number" --input - > /dev/null
+        printf '%s' "$body" | jq -Rs '{body: .}' | api PATCH "issues/$number" --input - > /dev/null
       else
         if [ "$(printf '%s' "$existing" | jq -j '.handled | tostring')" = true ]; then
           exit "$report_status"
@@ -302,7 +328,7 @@ vars:
       fi
     fi
     if [ -z "$number" ]; then
-      issue=$(jq -n --arg body "$body" '{title: "의존성 보안 취약점 정기 검사", body: $body}' |
+      issue=$(printf '%s' "$body" | jq -Rs '{title: "의존성 보안 취약점 정기 검사", body: .}' |
         api POST issues --input -)
       number=$(printf '%s' "$issue" | jq -je '.number | numbers | tostring')
     fi
