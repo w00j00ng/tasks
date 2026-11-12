@@ -240,7 +240,7 @@ tasks:
           command go "$@"
         }
         export SECURITY_RESULT_FILE="$tmp/result.json" SECURITY_SCAN_KEY=go-bcrypter-windows-cgo0 SECURITY_MODULE=bcrypter
-        for scenario in symbol package module clean strongest malformed empty config mode sbom; do
+        for scenario in symbol package module clean strongest malformed empty config mode sbom null false; do
           scanner_status=0
           jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
             {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$tmp/scanner.json"
@@ -254,6 +254,7 @@ tasks:
                 jq -n '{finding: {osv: "GO-2026-0001", fixed_version: "v1.2.3", trace: [{module: "example.com/dep", version: "v1.0.0"}]}}' >> "$tmp/scanner.json"
               fi ;;
             malformed) printf '{' >> "$tmp/scanner.json" ;;
+            null|false) printf '{"finding":%s}\n' "$scenario" >> "$tmp/scanner.json" ;;
             empty) : > "$tmp/scanner.json" ;;
             config|mode|sbom)
               updated=$(jq --arg scenario "$scenario" 'if $scenario == "sbom" then select(has("SBOM") | not)
@@ -273,7 +274,7 @@ tasks:
                 if [ "$mode" = ci ]; then
                   grep -qx 'vulnerable=true' "$log" || { cat "$tmp/scanner-output"; echo "FAIL: missing symbol CI output ($result)"; exit 1; }
                 else expected=3; fi ;;
-              malformed|empty|config|mode|sbom) expected=1 ;;
+              malformed|empty|config|mode|sbom|null|false) expected=1; test ! -s "$log" ;;
               *) test ! -s "$log" ;;
             esac
             if [ "$result" -ne "$expected" ]; then echo "FAIL scanner $scenario/$mode: expected $expected got $result"; exit 1; fi
@@ -573,13 +574,20 @@ tasks:
         # 요청: 성공한 Go job의 package/module 경고. 기대: 이슈·멘션을 만들고 도달 가능 취약점으로 단정하지 않음.
         for level in package module symbol; do
           go_reset
-          change --arg level "$level" '.artifacts[0].result.findings[0].level = $level'
+          change --arg level "$level" '.artifacts[0].result.findings[0] |= (.level = $level |
+            if $level == "module" then del(.traces[0][0].package) | .packages = []
+            elif $level == "symbol" then .packages += ["example.com/app/caller"] |
+              .traces += [(.traces[0] | .[0].function = "Unsafe" |
+                . + [{module: "example.com/app", package: "example.com/app/caller", function: "Read"}])]
+            else . end)'
           invoke 0
           check '(.issues | length) == 1 and (.comments | length) == 1 and
             (.issues[0].body | contains("GO-2026-0001") and contains("v1.0.0") and contains("v1.2.3") and contains("linux") and contains("cgo=0"))'
           if [ "$level" != symbol ]; then
             check '(.issues[0].body | contains("의존성 업데이트 경고")) and
               (.comments[0].body | contains("도달 가능한 취약점") | not)'
+          else
+            check '.issues[0].body | contains("example.com/dep/pkg") and (contains("example.com/app/caller") | not)'
           fi
         done
         echo 'PASS 22: successful Go jobs report warnings and reachable findings'
@@ -600,7 +608,7 @@ tasks:
         echo 'PASS 23: latest attempt is selected per full platform job name'
 
         # 요청: 최신 산출물이 없거나 만료·손상·다른 정체성. 기대: 실패, 과거 결과 대체·이슈 쓰기 없음.
-        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces; do
+        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated; do
           go_reset
           case "$scenario" in
             missing) change '.jobs += [(.jobs[0] | .id = 3 | .run_attempt = 3)]' ;;
@@ -619,6 +627,8 @@ tasks:
             scan-error) change '.artifacts[0].result.scan_status = "error"' ;;
             findings) change '.artifacts[0].result.findings = [{}]' ;;
             traces) change '.artifacts[0].result.findings[0].traces = [[null]]' ;;
+            overstated) change '.artifacts[0].result.findings[0].level = "symbol"' ;;
+            understated) change '.artifacts[0].result.findings[0].traces[0][0].function = "Unsafe"' ;;
           esac
           GITHUB_RUN_ATTEMPT=3 invoke 1
           check '(.issues | length) == 0 and (.comments | length) == 0'
@@ -663,3 +673,27 @@ tasks:
         check '(.issues | length) == 1 and (.comments | length) == 1 and
           (.issues[0].body | contains("GO-2026-0001") and contains("windows-cgo0") and contains("판정 불가") and contains("linux-cgo0"))'
         echo 'PASS 26: corrupt artifact files cannot contaminate later valid targets'
+
+        # 7개 모듈 × 4개 환경의 실제 크기 job 목록에서 Windows 경고를 이슈 하나로 보고한다.
+        go_reset
+        change '[("bcrypter","scrypter","helloworld","jumin","jwter","timetool","portwho") as $mod |
+          ("linux-cgo0","linux-cgo1","macos-cgo1","windows-cgo0") as $cfg | {mod: $mod, cfg: $cfg}] as $matrix |
+          .jobs = [$matrix[] as $t | .jobs[0] | .name = "dependency-scan (go/\($t.mod)/\($t.cfg))" |
+            .html_url += "/\($t.mod)/\($t.cfg)" | .steps = [range(28) | {number: ., name: "Check dependency toolchain and scan prerequisites",
+              status: "completed", conclusion: "success", started_at: "2026-11-06T22:23:00Z", completed_at: "2026-11-06T22:24:00Z"}]] |
+          .artifacts = [$matrix[] as $t | .artifacts[0] |
+            .result |= (.module = $t.mod | .scan_key = "go-\($t.mod)-\($t.cfg)" |
+              .target.goos = (if $t.cfg == "macos-cgo1" then "darwin" else ($t.cfg | split("-")[0]) end) |
+              .target.cgo = $t.cfg[-1:] |
+              .findings = (if $t.cfg == "windows-cgo0" and ($t.mod == "bcrypter" or $t.mod == "scrypter") then
+                [(if $t.mod == "bcrypter" then "bmp" else "tiff" end) as $pkg | .findings[0] |
+                  .osv = "GO-TEST-0001" | .module = "golang.org/x/image" | .packages = ["golang.org/x/image/\($pkg)"] |
+                  .traces[0][0] |= (.module = "golang.org/x/image" | .package = "golang.org/x/image/\($pkg)")]
+                else [] end)) | .name = "security-scan-\(.result.scan_key)-attempt-2"]'
+        invoke 0
+        check '([.requests[] | select(.method == "DOWNLOAD")] | length) == 28 and
+          (.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | [split("\n")[] | select(contains("GO-TEST-0001"))] |
+            length == 1 and (.[0] | contains("golang.org/x/image/bmp") and contains("golang.org/x/image/tiff") and
+              contains("go/bcrypter/windows-cgo0") and contains("go/scrypter/windows-cgo0")))'
+        echo 'PASS 27: full Go matrix reports affected packages in one issue row'
