@@ -130,6 +130,24 @@ GitHub 본문 한도를 지키기 위해 보고 본문은 UTF-8 60,000바이트 
 서브모듈은 소비 저장소에 기록한 커밋으로 고정하며 자동으로 최신 커밋을 따라가지 않습니다.
 공통 변경 후 검증한 커밋으로 서브모듈 포인터를 별도로 갱신하세요.
 
+## 환경 단위 Go 검사
+
+환경별 job 이름은 `dependency-scan (go-batch/<target>)`입니다.
+`target`은 `linux-cgo0`, `linux-cgo1`, `windows-cgo0`, `macos-cgo1` 중 하나입니다.
+`SECURITY_BATCH_TARGET`과 새 출력 디렉터리 `SECURITY_RESULT_DIR`을 지정한 뒤
+`task --exit-code security:scan-batch MODULES="bcrypter scrypter"`를 실행합니다.
+출력 디렉터리는 새로 만들며 이미 존재하면 실패합니다. CGO 설정은 환경에서 상속합니다.
+
+모든 모듈을 검사하고 `manifest.json`에 모듈 목록을 기록합니다. 각 모듈 디렉터리에
+`security-result.json`과 `exit-code`를 보존합니다. 호출 경로가 확인된 취약점은
+기존 로컬 종료 코드 3 또는 CI 출력으로 전달하고, 하나라도 검사 오류가 있으면 전체 작업은 실패합니다.
+
+`security-scan-go-batch-<target>-attempt-<run_attempt>` 산출물에 출력 디렉터리를 업로드합니다.
+보고기는 환경별 최신 시도의 산출물을 한 번 내려받고 각 모듈을 판정합니다.
+일부 결과가 없거나 손상되면 그 모듈은 판정 불가로 기록하며 다른 유효한 발견은 보고합니다.
+Task 자체의 실패와 스캐너 결과도 대조합니다. 보고만 재실행하면 이전 검사 시도의 결과를 재사용합니다.
+기존 모듈별 산출물과 npm 보고 규약도 지원합니다.
+
 ## 검증
 
 테스트 구현은 `Taskfile.test.yml`에 두고 루트 `Taskfile.yml`에서 포함합니다.

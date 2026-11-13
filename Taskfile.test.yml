@@ -19,7 +19,7 @@ tasks:
         fixture="$tmp/state.json"
         log="$tmp/log"
         other_scan=
-        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; if [ -n "${other_scan:-}" ]; then rmdir "$other_scan"; fi; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
+        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json" "$tmp/module/Taskfile.yml"; if [ -n "${other_scan:-}" ]; then rmdir "$other_scan"; fi; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
         export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
@@ -48,6 +48,20 @@ tasks:
             test "$1" = --dir; download_dir=$2
             change --arg name "$artifact_name" '.requests += [{method: "DOWNLOAD", path: $name}]'
             if jq -e '.download_failure == true' "$fixture" > /dev/null; then return 1; fi
+            if jq -e --arg name "$artifact_name" 'any(.artifacts[]; .name == $name and has("batch_modules"))' "$fixture" > /dev/null; then
+              jq --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .manifest' "$fixture" > "$download_dir/manifest.json"
+              batch_files=$(jq -jr --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .batch_modules | keys[] | . + " "' "$fixture")
+              for batch_module in $batch_files; do
+                mkdir "$download_dir/$batch_module"
+                if [ "$(jq -j '.missing_result // ""' "$fixture")" != "$batch_module" ]; then
+                  jq --arg name "$artifact_name" --arg module "$batch_module" '.artifacts[] | select(.name == $name) | .batch_modules[$module]' "$fixture" > "$download_dir/$batch_module/security-result.json"
+                fi
+                if [ "$(jq -j '.missing_exit // ""' "$fixture")" != "$batch_module" ]; then
+                  jq -j --arg module "$batch_module" '.module_exits[$module] // 0' "$fixture" > "$download_dir/$batch_module/exit-code"
+                fi
+              done
+              return
+            fi
             if jq -e --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .corrupt == true' "$fixture" > /dev/null; then
               printf '{' > "$download_dir/security-result.json"
             else
@@ -944,3 +958,173 @@ tasks:
         grep -Fq 'Expected exit 0; got 87' "$log"
         test -d "$tmp/module"
         echo 'PASS 35: early test failure preserves the caller directory'
+
+        batch_reset() {
+          go_reset
+          change '.jobs[0].name = "dependency-scan (go-batch/linux-cgo0)" |
+            .artifacts[0] |= (.name = "security-scan-go-batch-linux-cgo0-attempt-2" |
+              .manifest = {schema_version: 1, modules: ["bcrypter", "scrypter"]} |
+              .batch_modules = {bcrypter: .result, scrypter: (.result | .module = "scrypter" |
+                .scan_key = "go-scrypter-linux-cgo0" | .findings = [])} | del(.result))'
+        }
+        # 요청: 한 환경 job의 두 모듈 중 하나만 경고. 기대: 산출물 1회 읽고 모듈별로 보고.
+        batch_reset
+        invoke 0
+        check '(.issues | length) == 1 and (.issues[0].body | contains("GO-2026-0001") and contains("bcrypter")) and
+          ([.requests[] | select(.method == "DOWNLOAD")] | length) == 1'
+        echo 'PASS 36: environment jobs report all module results from one artifact'
+
+        # 요청: 같은 job의 다른 모듈이 실패·누락·손상. 기대: 유효 경고는 보존, 실패 모듈을 판정 불가로 보고.
+        for scenario in error missing missing-exit missing-result wrong-module task-error corrupt-manifest duplicate-manifest unexpected-module; do
+          batch_reset
+          case "$scenario" in
+            error) change '.artifacts[0].batch_modules.scrypter.scan_status = "error" | .jobs[0].conclusion = "failure"' ;;
+            missing) change 'del(.artifacts[0].batch_modules.scrypter)' ;;
+            missing-exit) change '.missing_exit = "scrypter"' ;;
+            missing-result) change '.missing_result = "scrypter"' ;;
+            task-error) change '.module_exits = {scrypter: 2} | .jobs[0].conclusion = "failure"' ;;
+            wrong-module) change '.artifacts[0].batch_modules.scrypter.module = "bcrypter"' ;;
+            corrupt-manifest) change '.artifacts[0].manifest = null' ;;
+            duplicate-manifest) change '.artifacts[0].manifest.modules = ["bcrypter", "bcrypter"]' ;;
+            unexpected-module) change '.artifacts[0].manifest.modules = ["../outside"]' ;;
+          esac
+          invoke 1
+          case "$scenario" in
+            error|missing|missing-exit|missing-result|wrong-module|task-error)
+              check '(.issues | length) == 1 and (.issues[0].body | contains("GO-2026-0001") and contains("scrypter") and contains("판정 불가"))' ;;
+            *) check '(.issues | length) == 0 and (.comments | length) == 0' ;;
+          esac
+        done
+        echo 'PASS 37: partial batch errors preserve valid findings and invalid manifests fail closed'
+
+        # 요청: 묶음 job이 symbol로 실패해도 다른 모듈은 정상. 기대: 정상 모듈을 판정 불가로 표시하지 않음.
+        batch_reset
+        change '.module_exits = {bcrypter: 3} | .jobs[0] |= (.conclusion = "failure" | .steps = [{name: "Fail for reachable vulnerabilities", conclusion: "failure"}]) |
+          .artifacts[0].batch_modules.bcrypter.findings[0] |= (.level = "symbol" | .traces[0][0].function = "Unsafe")'
+        invoke 0
+        check '(.issues[0].body | contains("GO-2026-0001") and (contains("판정 불가") | not))'
+        # 요청: 보고 전용 재시도. 기대: 앞선 환경별 최신 산출물 재사용, 같은 이슈·댓글 유지.
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1'
+        change '.artifacts[0].batch_modules.bcrypter.findings = [] | .module_exits = {} | .jobs[0].steps = []'
+        invoke 1
+        batch_reset
+        change '.jobs += [(.jobs[0] | .id = 2 | .run_attempt = 3)]'
+        GITHUB_RUN_ATTEMPT=3 invoke 1
+        check '(.issues | length) == 0 and all(.requests[]; .method != "DOWNLOAD")'
+        change '.artifacts[0] |= (.name = "security-scan-go-batch-linux-cgo0-attempt-3" |
+          .batch_modules |= with_entries(.value.run_attempt = 3 | .value.findings = []))'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 0 and ([.requests[] | select(.method == "DOWNLOAD")] | length) == 1'
+        echo 'PASS 38: batch gates and report-only retries keep per-module outcomes'
+
+        batch_scan() {
+        {{.SECURITY_SCAN_BATCH | indent 2}}
+        }
+        # 요청: 첫 모듈 오류나 취약점 뒤에도 모든 모듈 검사. 기대: 원래 결과 보존 및 마지막에 전체 상태 판정.
+        for scenario in clean warning symbol error mixed; do
+          for mode in local ci; do
+            batch_reset
+            change '.calls = [] | .module_exits = {}'
+            case "$scenario" in
+              clean) change '.artifacts[0].batch_modules.bcrypter.findings = []' ;;
+              symbol) change '.artifacts[0].batch_modules.bcrypter.findings[0] |= (.level = "symbol" | .traces[0][0].function = "Unsafe") |
+                .module_exits.bcrypter = 3' ;;
+              error|mixed) change '.artifacts[0].batch_modules.bcrypter.scan_status = "error" | .module_exits.bcrypter = 2'
+                if [ "$scenario" = mixed ]; then
+                  change '.artifacts[0].batch_modules.scrypter.findings = [(.artifacts[0].batch_modules.bcrypter.findings[0] |
+                    .level = "symbol" | .traces[0][0].function = "Unsafe")] | .module_exits.scrypter = 3'
+                fi ;;
+            esac
+            : > "$tmp/scanner-output"
+            set +e
+            (
+              set -e
+              task() {
+                for argument in "$@"; do case "$argument" in MODULE=*) requested_module=${argument#MODULE=} ;; esac; done
+                change --arg module "$requested_module" '.calls += [$module]'
+                jq --arg module "$requested_module" '.artifacts[0].batch_modules[$module]' "$fixture" > "$SECURITY_RESULT_FILE"
+                module_exit=$(jq -j --arg module "$requested_module" '.module_exits[$module] // 0' "$fixture")
+                return "$module_exit"
+              }
+              export SECURITY_RESULT_DIR="$tmp/batch-results" SECURITY_BATCH_TARGET=linux-cgo0
+              export SECURITY_ROOT_DIR="$PWD" SECURITY_MODULES="bcrypter scrypter"
+              if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$tmp/scanner-output"; else unset GITHUB_OUTPUT; fi
+              batch_scan
+            ) > "$log" 2>&1
+            result=$?
+            set -e
+            expected=0
+            case "$scenario/$mode" in symbol/local) expected=3 ;; error/*|mixed/*) expected=1 ;; esac
+            if [ "$result" -ne "$expected" ]; then cat "$log"; echo "$scenario/$mode expected $expected got $result"; exit 1; fi
+            check '.calls == ["bcrypter", "scrypter"]'
+            jq -e '.schema_version == 1 and .modules == ["bcrypter", "scrypter"]' "$tmp/batch-results/manifest.json" > /dev/null
+            for module in bcrypter scrypter; do
+              jq -e --arg module "$module" '.module == $module and .scan_key == ("go-" + $module + "-linux-cgo0")' \
+                "$tmp/batch-results/$module/security-result.json" > /dev/null
+              rm "$tmp/batch-results/$module/security-result.json" "$tmp/batch-results/$module/exit-code"
+              rmdir "$tmp/batch-results/$module"
+            done
+            case "$scenario/$mode" in symbol/ci|mixed/ci) grep -qx 'vulnerable=true' "$tmp/scanner-output" ;;
+              *) test ! -s "$tmp/scanner-output" ;; esac
+            rm "$tmp/batch-results/manifest.json"
+            rmdir "$tmp/batch-results"
+          done
+        done
+        echo 'PASS 39: batch scans finish every module and preserve local and CI failure semantics'
+
+        # 요청: 실제 소비 Task 진입점에서 첫 자식 Task가 실패. 기대: 나머지 모듈도 실행, 환경·작업 디렉터리 보존.
+        consumer_root=$(cd "$tmp/module" && pwd -P)
+        stub_scan='
+          test "$(pwd -P)" = "$BATCH_EXPECTED_ROOT"
+          scan_module=${SECURITY_SCAN_KEY#go-}
+          scan_module=${scan_module%-linux-cgo0}
+          jq -n --arg module "$scan_module" --arg key "$SECURITY_SCAN_KEY" \
+            "{module: \$module, scan_key: \$key, scan_status: \"complete\", scanner_exit: 0, findings: []}" > "$SECURITY_RESULT_FILE"
+          if [ "$BATCH_FAIL_MODULE" = "$scan_module" ]; then exit 2; fi'
+        jq -n --arg source {{.TASKFILE_DIR | shellQuote}}/Taskfile.yml --arg scan "$stub_scan" '
+          {version: "3", silent: true, includes: {shared: {taskfile: $source, dir: "."}},
+            tasks: {"security:scan": {cmds: [$scan]}}}' > "$tmp/module/Taskfile.yml"
+        for invalid_modules in "bcrypter bcrypter" "../outside"; do
+          set +e
+          BATCH_EXPECTED_ROOT="$consumer_root" BATCH_FAIL_MODULE=none \
+            SECURITY_BATCH_TARGET=linux-cgo0 SECURITY_RESULT_DIR="$consumer_root/invalid-results" \
+            task --silent --exit-code --dir "$consumer_root" shared:security:scan-batch MODULES="$invalid_modules" > "$log" 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          test ! -e "$consumer_root/invalid-results"
+        done
+        mkdir "$consumer_root/existing-results"
+        printf 'preserved' > "$consumer_root/existing-results/marker"
+        set +e
+        BATCH_EXPECTED_ROOT="$consumer_root" BATCH_FAIL_MODULE=none \
+          SECURITY_BATCH_TARGET=linux-cgo0 SECURITY_RESULT_DIR="$consumer_root/existing-results" \
+          task --silent --exit-code --dir "$consumer_root" shared:security:scan-batch MODULES="bcrypter scrypter" > "$log" 2>&1
+        result=$?
+        set -e
+        test "$result" -ne 0
+        test "$(cat "$consumer_root/existing-results/marker")" = preserved
+        rm "$consumer_root/existing-results/marker"
+        rmdir "$consumer_root/existing-results"
+        for mode in clean bcrypter; do
+          set +e
+          BATCH_EXPECTED_ROOT="$consumer_root" BATCH_FAIL_MODULE="$mode" \
+            SECURITY_BATCH_TARGET=linux-cgo0 SECURITY_RESULT_DIR="$consumer_root/results-$mode" \
+            task --silent --exit-code --dir "$consumer_root" shared:security:scan-batch MODULES="bcrypter scrypter" > "$log" 2>&1
+          result=$?
+          set -e
+          expected=0
+          if [ "$mode" = bcrypter ]; then expected=1; fi
+          if [ "$result" -ne "$expected" ]; then cat "$log"; echo "Task batch $mode expected $expected got $result"; exit 1; fi
+          for module in bcrypter scrypter; do
+            jq -e --arg module "$module" '.module == $module and .scan_key == ("go-" + $module + "-linux-cgo0")' \
+              "$consumer_root/results-$mode/$module/security-result.json" > /dev/null
+            rm "$consumer_root/results-$mode/$module/security-result.json" "$consumer_root/results-$mode/$module/exit-code"
+            rmdir "$consumer_root/results-$mode/$module"
+          done
+          rm "$consumer_root/results-$mode/manifest.json"
+          rmdir "$consumer_root/results-$mode"
+        done
+        rm "$tmp/module/Taskfile.yml"
+        echo 'PASS 40: real consumer batch entry preserves child routing and continues after failure'
