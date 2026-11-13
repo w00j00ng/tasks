@@ -12,10 +12,14 @@ tasks:
           echo 'security:test must run in ROOT_DIR' >&2
           exit 1
         fi
-        tmp=$(mktemp -d -p . .security-test.XXXXXXXX)
+        case "${OS:-}" in
+          Windows_NT) tmp=$(mktemp -d -p "$(pwd -P)" .security-test.XXXXXXXX) ;;
+          *) tmp=$(mktemp -d "$(pwd -P)/.security-test.XXXXXXXX") ;;
+        esac
         fixture="$tmp/state.json"
         log="$tmp/log"
-        trap 'rm -f "$fixture" "$log"; rmdir "$tmp"' EXIT
+        other_scan=
+        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; if [ -n "${other_scan:-}" ]; then rmdir "$other_scan"; fi; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
         export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
@@ -25,7 +29,7 @@ tasks:
             created_at: "2026-11-06T22:23:00Z"}, jobs: [{id: 1, run_attempt: 2, name: "dependency-scan (bcrypter)", status: "completed",
             conclusion: "failure", html_url: "https://github.com/w00j00ng/goproj/actions/runs/123/job/bcrypter",
             steps: [{name: "Fail for reachable vulnerabilities", conclusion: "failure"}]}],
-            issues: [], comments: [], requests: [], fail_method: "", fail_path: ""}' > "$fixture"
+            artifacts: [], issues: [], comments: [], requests: [], fail_method: "", fail_path: ""}' > "$fixture"
         }
         change() {
           updated=$(jq "$@" "$fixture")
@@ -36,6 +40,28 @@ tasks:
         }
         # gh is the API boundary; unexpected requests fail instead of reaching GitHub.
         gh() {
+          if [ "$1 $2" = 'run download' ]; then
+            shift 2
+            test "$1" = "$GITHUB_RUN_ID"; shift
+            test "$1" = --repo; test "$2" = "$GITHUB_REPOSITORY"; shift 2
+            test "$1" = --name; artifact_name=$2; shift 2
+            test "$1" = --dir; download_dir=$2
+            change --arg name "$artifact_name" '.requests += [{method: "DOWNLOAD", path: $name}]'
+            if jq -e '.download_failure == true' "$fixture" > /dev/null; then return 1; fi
+            if jq -e --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .corrupt == true' "$fixture" > /dev/null; then
+              printf '{' > "$download_dir/security-result.json"
+            else
+              jq --arg name "$artifact_name" '.artifacts[] | select(.name == $name) | .result' "$fixture" > "$download_dir/security-result.json"
+            fi
+            if jq -e '.multiple_results == true' "$fixture" > /dev/null; then
+              original=$(cat "$download_dir/security-result.json")
+              printf '{}\n%s\n' "$original" > "$download_dir/security-result.json"
+            fi
+            if jq -e --arg name "$artifact_name" '.extra_file == true or any(.artifacts[]; .name == $name and .extra_file == true)' "$fixture" > /dev/null; then
+              printf 'unexpected' > "$download_dir/extra.txt"
+            fi
+            return
+          fi
           endpoint=${2#"$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/"}
           method=$4
           change --arg method "$method" --arg path "$endpoint" '.requests += [{method: $method, path: $path}]'
@@ -45,7 +71,7 @@ tasks:
             return 1
           fi
           case "$method $endpoint" in
-            'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100'|'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100'|'GET issues/'*'/comments')
+            'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100'|'GET actions/runs/'"$GITHUB_RUN_ID"'/artifacts?per_page=100'|'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100'|'GET issues/'*'/comments')
               for option in --paginate --slurp; do
                 case " $* " in
                   *" $option "*) ;;
@@ -57,6 +83,8 @@ tasks:
             'GET actions/runs/'"$GITHUB_RUN_ID") jq .run "$fixture" ;;
             'GET actions/runs/'"$GITHUB_RUN_ID"'/jobs?filter=all&per_page=100')
               jq '[range(0; (.jobs | length); 100) as $i | {jobs: .jobs[$i:$i+100]}]' "$fixture" ;;
+            'GET actions/runs/'"$GITHUB_RUN_ID"'/artifacts?per_page=100')
+              jq '[{artifacts: .artifacts}]' "$fixture" ;;
             'GET issues?state=all&creator=github-actions%5Bbot%5D&per_page=100')
               jq '.issues | [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
             'GET issues/'*'/comments')
@@ -64,27 +92,29 @@ tasks:
               jq --argjson number "$number" '[.comments[] | select(.issue_number == $number)] |
                 [range(0; length; 100) as $i | .[$i:$i+100]]' "$fixture" ;;
             'POST issues')
-              payload=$(cat)
-              change --argjson payload "$payload" '.issues += [($payload + {number: (([.issues[].number,41] | max) + 1),
+              cat > "$tmp/payload.json"
+              jq -e '.body | length <= 65536' "$tmp/payload.json" > /dev/null || return 1
+              change --slurpfile payload "$tmp/payload.json" '.issues += [($payload[0] + {number: (([.issues[].number,41] | max) + 1),
                 state: "open", user: {login: "github-actions[bot]"}})]'
               jq '.issues[-1]' "$fixture" ;;
             'PATCH issues/'*)
-              number=${endpoint#issues/}; payload=$(cat)
+              number=${endpoint#issues/}; cat > "$tmp/payload.json"
+              jq -e '.body | length <= 65536' "$tmp/payload.json" > /dev/null || return 1
               if jq -e --argjson number "$number" '.close_before_patch == $number' "$fixture" > /dev/null; then
                 change --argjson number "$number" '(.issues[] | select(.number == $number)).state = "closed" | .close_before_patch = null'
               fi
-              if jq -e --argjson payload "$payload" '.fail_finalize == true and
-                ($payload.body | contains("<!-- dependency-security-pending:") | not)' "$fixture" > /dev/null; then
+              if jq -e --slurpfile payload "$tmp/payload.json" '.fail_finalize == true and
+                ($payload[0].body | contains("<!-- dependency-security-pending:") | not)' "$fixture" > /dev/null; then
                 printf 'HTTP Error 503\n' >&2
                 return 1
               fi
-              change --argjson number "$number" --argjson payload "$payload" \
-                '(.issues[] | select(.number == $number)) += $payload'
+              change --argjson number "$number" --slurpfile payload "$tmp/payload.json" \
+                '(.issues[] | select(.number == $number)) += $payload[0]'
               jq --argjson number "$number" '.issues[] | select(.number == $number)' "$fixture" ;;
             'POST issues/'*'/comments')
-              number=${endpoint#issues/}; number=${number%/comments}; payload=$(cat)
-              change --argjson number "$number" --argjson payload "$payload" \
-                '.comments += [($payload + {issue_number: $number, user: {login: "github-actions[bot]"}})]'
+              number=${endpoint#issues/}; number=${number%/comments}; cat > "$tmp/payload.json"
+              change --argjson number "$number" --slurpfile payload "$tmp/payload.json" \
+                '.comments += [($payload[0] + {issue_number: $number, user: {login: "github-actions[bot]"}})]'
               printf '{}\n' ;;
             *) printf 'Unexpected API request: %s %s\n' "$method" "$endpoint" >&2; return 1 ;;
           esac
@@ -198,29 +228,145 @@ tasks:
         check '(.issues | length) == 1 and (.comments | length) == 1'
         echo 'PASS 9: report-only retry reuses previous scan and issue'
 
-        # 요청: 검사 종료 0·1·2·3·127. 기대: CI에서 3만 취약점 표시, 로컬에서는 원래 종료값 유지.
+        # 요청: JSON 모드 종료 0에도 발견 수준을 구분. 기대: symbol만 실패, package/module은 경고.
         scan() {
         {{.SECURITY_SCAN | indent 2}}
         }
-        govulncheck() { return "$scanner_status"; }
-        for scanner_status in 0 1 2 3 127; do
+        govulncheck() {
+          test "$*" = '-json -test ./...'
+          cat "$tmp/scanner.json"
+          return "$scanner_status"
+        }
+        go_env_failure=false
+        go() {
+          if [ "$go_env_failure" = true ]; then return 2; fi
+          command go "$@"
+        }
+        export SECURITY_RESULT_FILE="$tmp/result.json" SECURITY_SCAN_KEY=go-bcrypter-windows-cgo0 SECURITY_MODULE=bcrypter
+        for scenario in symbol package module clean strongest malformed empty config mode sbom null false function-type function-package package-type package-module version-module fixed-type package-trace module-trace config-null config-false config-duplicate sbom-null sbom-false sbom-duplicate; do
+          scanner_status=0
+          jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+            {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$tmp/scanner.json"
+          case "$scenario" in
+            symbol|package|module|strongest)
+              jq -n --arg scenario "$scenario" '{finding: {osv: "GO-2026-0001", fixed_version: "v1.2.3", trace: [
+                ({module: "example.com/dep", version: "v1.0.0"} +
+                  (if $scenario == "module" then {} else {package: "example.com/dep/pkg"} end) +
+                  (if $scenario == "symbol" or $scenario == "strongest" then {function: "Unsafe"} else {} end))]}}' >> "$tmp/scanner.json"
+              if [ "$scenario" = strongest ]; then
+                jq -n '{finding: {osv: "GO-2026-0001", fixed_version: "v1.2.3", trace: [{module: "example.com/dep", version: "v1.0.0"}]}}' >> "$tmp/scanner.json"
+              fi ;;
+            malformed) printf '{' >> "$tmp/scanner.json" ;;
+            null|false) printf '{"finding":%s}\n' "$scenario" >> "$tmp/scanner.json" ;;
+            package-trace|module-trace)
+              jq -n --arg scenario "$scenario" '{finding: {osv: "GO-TEST-0001", trace: [
+                ({module: "example.com/dep", version: "v1.0.0"} +
+                  (if $scenario == "package-trace" then {package: "example.com/dep/pkg"} else {} end)),
+                {module: "example.com/app", package: "example.com/app", function: "Run"}]}}' >> "$tmp/scanner.json" ;;
+            config-*|sbom-*)
+              jq --arg scenario "$scenario" 'if ($scenario | startswith("config-")) then select(has("config")) else select(has("SBOM")) end |
+                if ($scenario | endswith("-null")) then map_values(null)
+                elif ($scenario | endswith("-false")) then map_values(false) else . end' "$tmp/scanner.json" > "$tmp/payload.json"
+              cat "$tmp/payload.json" >> "$tmp/scanner.json" ;;
+            function-type|function-package|package-type|package-module|version-module|fixed-type)
+              jq -n --arg scenario "$scenario" '{finding: {osv: "GO-TEST-0001", trace: [{module: "example.com/dep", version: "v1.0.0"}]}} |
+                if $scenario == "function-type" then .finding.trace[0] += {package: "example.com/dep/pkg", function: false}
+                elif $scenario == "function-package" then .finding.trace[0].function = "Read"
+                elif $scenario == "package-type" then .finding.trace[0].package = false
+                elif $scenario == "package-module" then .finding.trace += [{package: "example.com/app"}]
+                elif $scenario == "version-module" then .finding.trace += [{version: "v1.0.0"}]
+                else .finding.fixed_version = false end' >> "$tmp/scanner.json" ;;
+            empty) : > "$tmp/scanner.json" ;;
+            config|mode|sbom)
+              updated=$(jq --arg scenario "$scenario" 'if $scenario == "sbom" then select(has("SBOM") | not)
+                elif has("config") then .config[if $scenario == "mode" then "scan_mode" else "scan_level" end] = "invalid" else . end' "$tmp/scanner.json")
+              printf '%s\n' "$updated" > "$tmp/scanner.json" ;;
+          esac
           for mode in ci local; do
             : > "$log"
             if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$log"; else unset GITHUB_OUTPUT; fi
             set +e
-            (set -e; scan)
+            (set -e; scan) > "$tmp/scanner-output" 2>&1
             result=$?
             set -e
-            expected=$scanner_status
-            if [ "$mode" = ci ] && [ "$scanner_status" -eq 3 ]; then
-              expected=0
-              grep -qx 'vulnerable=true' "$log"
+            expected=0
+            case "$scenario" in
+              symbol|strongest)
+                if [ "$mode" = ci ]; then
+                  grep -qx 'vulnerable=true' "$log" || { cat "$tmp/scanner-output"; echo "FAIL: missing symbol CI output ($result)"; exit 1; }
+                else expected=3; fi ;;
+              malformed|empty|config|mode|sbom|null|false|function-type|function-package|package-type|package-module|version-module|fixed-type|package-trace|module-trace|config-*|sbom-*) expected=1; test ! -s "$log" ;;
+              *) test ! -s "$log" ;;
+            esac
+            if [ "$result" -ne "$expected" ]; then echo "FAIL scanner $scenario/$mode: expected $expected got $result"; exit 1; fi
+            if [ "$expected" -ne 1 ]; then
+              jq -e --arg scenario "$scenario" '.schema_version == 1 and .repository == "w00j00ng/goproj" and
+                .run_id == 123 and .run_attempt == 2 and .scan_key == "go-bcrypter-windows-cgo0" and .module == "bcrypter" and
+                .scan_status == "complete" and .scanner_exit == 0 and .scanner_version == "v1.9.0" and
+                (.target.goos | length > 0) and (.go_version | length > 0) and
+                (if $scenario == "clean" then .findings == [] else (.findings | length) == 1 and
+                .findings[0].level == (if $scenario == "strongest" then "symbol" else $scenario end) and
+                .findings[0].fixed_version == "v1.2.3" and
+                (if $scenario == "strongest" then (.findings[0].traces | length) == 2 and
+                  .findings[0].packages == ["example.com/dep/pkg"] else true end) end)' "$SECURITY_RESULT_FILE" > /dev/null
             else
-              test ! -s "$log"
+              jq -e '.scan_status == "error" and .scanner_exit == 0' "$SECURITY_RESULT_FILE" > /dev/null
             fi
-            test "$result" -eq "$expected"
           done
         done
+        for scanner_status in 1 2 3 127; do
+          expected=$scanner_status
+          printf '{}\n' > "$tmp/scanner.json"
+          for mode in ci local; do
+            : > "$log"
+            if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$log"; else unset GITHUB_OUTPUT; fi
+            set +e
+            (set -e; scan) > /dev/null 2>&1
+            result=$?
+            set -e
+            test "$result" -eq "$expected"
+            test ! -s "$log"
+            jq -e --argjson status "$scanner_status" '.scan_status == "error" and .scanner_exit == $status' "$SECURITY_RESULT_FILE" > /dev/null
+          done
+        done
+        # 요청: Go 환경 조회 실패로 scanner 미실행. 기대: 작업 실패와 scanner_exit null을 기록.
+        go_env_failure=true
+        set +e
+        (set -e; scan) > /dev/null 2>&1
+        result=$?
+        set -e
+        test "$result" -eq 2
+        jq -e '.scan_status == "error" and .scanner_exit == null' "$SECURITY_RESULT_FILE" > /dev/null
+        go_env_failure=false
+        unset SECURITY_RESULT_FILE SECURITY_SCAN_KEY SECURITY_MODULE
+        # 요청: 소비 include의 중첩 MODULE에서 실제 스캔 작업 실행. 기대: 모듈 작업 디렉터리에 결과를 쓰고 임시 파일 정리.
+        mkdir "$tmp/module"
+        export SECURITY_SCANNER_FIXTURE="$(cd "$tmp" && pwd)/scanner.json"
+        jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+          {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}}' > "$SECURITY_SCANNER_FIXTURE"
+        scan_source={{.SECURITY_SCAN | shellQuote}}
+        entry_scan='govulncheck() { cat "$SECURITY_SCANNER_FIXTURE"; }; '
+        # Included Taskfile vars override CLI globals; task-call vars keep this scanner stub local.
+        jq -n --arg source {{.TASKFILE_DIR | shellQuote}}/Taskfile.yml --arg scan "$entry_scan$scan_source" \
+          '{version: "3", silent: true, includes: {shared: {taskfile: $source, dir: ".", flatten: true}},
+            tasks: {entry: {cmds: [{task: "security:scan", vars: {MODULE: "module", SECURITY_SCAN: $scan}}]}}}' > "$tmp/Taskfile.entry.yml"
+        CGO_ENABLED=0 task --silent --exit-code --taskfile "$tmp/Taskfile.entry.yml" entry > "$tmp/scanner-output"
+        jq -e '.scan_status == "complete" and .target.cgo == "0"' "$tmp/scanner-output" > /dev/null
+        for leftover in "$tmp/module"/.security-scan.*; do
+          if [ -d "$leftover" ]; then echo "Scanner temp directory leaked: $leftover"; exit 1; fi
+        done
+        # 요청: 실제 Task 진입점의 명시 CGO 설정과 미설정. 기대: 0/1 상속, 기본값 0.
+        for cgo in 0 1 default; do
+          if [ "$cgo" = default ]; then
+            actual=$(unset CGO_ENABLED; task --silent --taskfile "$tmp/Taskfile.entry.yml" entry)
+            expected_cgo=0
+          else
+            actual=$(CGO_ENABLED=$cgo task --silent --taskfile "$tmp/Taskfile.entry.yml" entry)
+            expected_cgo=$cgo
+          fi
+          test "$(printf '%s' "$actual" | jq -j .target.cgo)" = "$expected_cgo"
+        done
+        unset SECURITY_SCANNER_FIXTURE
         echo 'PASS 10: scanner classification'
 
         # 요청: npm 정상/취약점/레지스트리 오류/잘못된 응답. 기대: high·critical만 발견 표시, 오류는 알림 제외.
@@ -232,11 +378,11 @@ tasks:
           printf '%s' "$npm_response"
           return "$npm_status"
         }
-        for scenario in clean moderate high critical registry malformed other-error; do
+        for scenario in clean low moderate high critical registry malformed other-error; do
           npm_status=0; count=0
           npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":0}}}'
           case "$scenario" in
-            moderate) npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":0,"moderate":2}}}' ;;
+            low|moderate) npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":0,"low":1,"moderate":2}}}' ;;
             high) npm_status=1; count=1; npm_response='{"metadata":{"vulnerabilities":{"high":1,"critical":0}}}' ;;
             critical) npm_status=1; count=1; npm_response='{"metadata":{"vulnerabilities":{"high":0,"critical":1}}}' ;;
             registry) npm_status=1; npm_response='{"error":{"code":"E503"}}' ;;
@@ -256,7 +402,7 @@ tasks:
             else
               test ! -s "$log"
               case "$scenario" in
-                clean|moderate) test "$result" -eq 0 ;;
+                clean|low|moderate) test "$result" -eq 0 ;;
                 *) test "$result" -ne 0 ;;
               esac
             fi
@@ -434,3 +580,367 @@ tasks:
         check '(.issues | length) == 1 and .issues[0].state == "closed" and (.comments | length) == 1 and
           all(.requests[]; .method != "POST")'
         echo 'PASS 21: closing an already reported retry cannot create a duplicate issue'
+
+        go_reset() {
+          reset
+          change '.jobs[0] |= (.name = "dependency-scan (go/bcrypter/linux-cgo0)" | .conclusion = "success" | .steps = []) |
+            .artifacts = [{id: 7, name: "security-scan-go-bcrypter-linux-cgo0-attempt-2", expired: false,
+              workflow_run: {id: 123, head_sha: .run.head_sha}, result: {
+                schema_version: 1, repository: "w00j00ng/goproj", head_sha: .run.head_sha, run_id: 123, run_attempt: 2,
+                scan_key: "go-bcrypter-linux-cgo0", module: "bcrypter", target: {goos: "linux", goarch: "amd64", cgo: "0"},
+                go_version: "go1.27.4", scanner_version: "v1.9.0", scan_status: "complete", scanner_exit: 0,
+                findings: [{osv: "GO-2026-0001", level: "package", module: "example.com/dep", version: "v1.0.0",
+                  fixed_version: "v1.2.3", packages: ["example.com/dep/pkg"], traces: [[{module: "example.com/dep", version: "v1.0.0", package: "example.com/dep/pkg"}]]}]}}]'
+        }
+        # 요청: 성공한 Go job의 package/module 경고. 기대: 이슈·멘션을 만들고 도달 가능 취약점으로 단정하지 않음.
+        for level in package module symbol; do
+          go_reset
+          change --arg level "$level" '.artifacts[0].result.findings[0] |= (.level = $level |
+            if $level == "module" then del(.traces[0][0].package) | .packages = []
+            elif $level == "symbol" then .packages += ["example.com/app/caller"] |
+              .traces += [(.traces[0] | .[0].function = "Unsafe" |
+                . + [{module: "example.com/app", package: "example.com/app/caller", function: "Read"}])]
+            else . end)'
+          invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            (.issues[0].body | contains("GO-2026-0001") and contains("v1.0.0") and contains("v1.2.3") and contains("linux") and contains("cgo=0"))'
+          if [ "$level" != symbol ]; then
+            check '(.issues[0].body | contains("의존성 업데이트 경고")) and
+              (.comments[0].body | contains("도달 가능한 취약점") | not)'
+          else
+            check '.issues[0].body | contains("example.com/dep/pkg") and (contains("example.com/app/caller") | not)'
+          fi
+        done
+        echo 'PASS 22: successful Go jobs report warnings and reachable findings'
+
+        # 요청: 보고 job만 재시도, 플랫폼별 최신 검사. 기대: 이전 scan 산출물 재사용, 새 플랫폼을 보존.
+        go_reset
+        change '.jobs += [(.jobs[0] | .id = 2 | .name = "dependency-scan (go/bcrypter/windows-cgo0)")] |
+          .artifacts += [(.artifacts[0] | .id = 8 | .name = "security-scan-go-bcrypter-windows-cgo0-attempt-2" |
+            .result.scan_key = "go-bcrypter-windows-cgo0" | .result.target.goos = "windows")]'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues[0].body | contains("linux-cgo0") and contains("windows-cgo0")) and (.comments | length) == 1 and
+          (.issues[0].body | [scan("\\| \\[GO-2026-0001\\]")] | length) == 1'
+        change '.jobs += [(.jobs[0] | .id = 3 | .run_attempt = 3)] |
+          .artifacts += [(.artifacts[0] | .id = 9 | .name = "security-scan-go-bcrypter-linux-cgo0-attempt-3" |
+            .result.run_attempt = 3 | .result.findings = [])]'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues[0].body | contains("windows-cgo0") and (contains("linux-cgo0") | not))'
+        echo 'PASS 23: latest attempt is selected per full platform job name'
+
+        # 요청: 최신 산출물이 없거나 만료·손상·다른 정체성. 기대: 실패, 과거 결과 대체·이슈 쓰기 없음.
+        for scenario in missing expired corrupt multiple extra repository sha run attempt key module target schema scan-error findings traces overstated understated function-type function-package package-type package-module version-module package-trace module-trace mixed-trace; do
+          go_reset
+          case "$scenario" in
+            missing) change '.jobs += [(.jobs[0] | .id = 3 | .run_attempt = 3)]' ;;
+            expired) change '.artifacts[0].expired = true' ;;
+            corrupt) change '.artifacts[0].corrupt = true' ;;
+            multiple) change '.multiple_results = true' ;;
+            extra) change '.extra_file = true' ;;
+            repository) change '.artifacts[0].result.repository = "w00j00ng/glorycourse"' ;;
+            sha) change '.artifacts[0].result.head_sha = "other"' ;;
+            run) change '.artifacts[0].result.run_id = 124' ;;
+            attempt) change '.artifacts[0].result.run_attempt = 1' ;;
+            key) change '.artifacts[0].result.scan_key = "other"' ;;
+            module) change '.artifacts[0].result.module = "scrypter"' ;;
+            target) change '.artifacts[0].result.target.cgo = "1"' ;;
+            schema) change '.artifacts[0].result.schema_version = 2' ;;
+            scan-error) change '.artifacts[0].result.scan_status = "error"' ;;
+            findings) change '.artifacts[0].result.findings = [{}]' ;;
+            traces) change '.artifacts[0].result.findings[0].traces = [[null]]' ;;
+            overstated) change '.artifacts[0].result.findings[0].level = "symbol"' ;;
+            understated) change '.artifacts[0].result.findings[0].traces[0][0].function = "Unsafe"' ;;
+            function-type) change '.artifacts[0].result.findings[0].traces[0][0].function = false' ;;
+            function-package) change '.artifacts[0].result.findings[0] |= (.level = "symbol" | .traces[0][0].function = "Read" | del(.traces[0][0].package))' ;;
+            package-type) change '.artifacts[0].result.findings[0] |= (.level = "module" | .traces[0][0].package = false)' ;;
+            package-module) change '.artifacts[0].result.findings[0].traces[0] += [{package: "example.com/app"}]' ;;
+            version-module) change '.artifacts[0].result.findings[0].traces[0] += [{version: "v1.0.0"}]' ;;
+            package-trace|module-trace|mixed-trace)
+              change --arg scenario "$scenario" '.artifacts[0].result.findings[0] |= (
+                .traces[0] += [{module: "example.com/app", package: "example.com/app", function: "Run"}] |
+                if $scenario == "module-trace" then .level = "module" | del(.traces[0][0].package)
+                elif $scenario == "mixed-trace" then .level = "symbol" | .traces += [(.traces[0] | .[0].function = "Unsafe")]
+                else . end)' ;;
+          esac
+          GITHUB_RUN_ATTEMPT=3 invoke 1
+          check '(.issues | length) == 0 and (.comments | length) == 0'
+        done
+        echo 'PASS 24: missing and invalid latest artifacts are unknown, never clean'
+
+        # 요청: 유효 경고와 다른 플랫폼 검사 오류, API 실패. 기대: 경고/판정 불가 보고 후 실패, API 오류 시 쓰기 없음.
+        go_reset
+        change '.jobs += [(.jobs[0] | .id = 2 | .name = "dependency-scan (go/bcrypter/macos-cgo1)" | .conclusion = "failure")]'
+        invoke 1
+        check '(.issues[0].body | contains("GO-2026-0001") and contains("판정 불가") and contains("macos-cgo1"))'
+        change '.issues[0].state = "closed"'
+        invoke 1
+        check '(.issues | length) == 1 and (.comments | length) == 1'
+        go_reset
+        change '.jobs[0].conclusion = "failure"'
+        invoke 1
+        check '(.issues[0].body | contains("GO-2026-0001") and contains("판정 불가"))'
+        for failure in api download; do
+          go_reset
+          if [ "$failure" = api ]; then
+            change '.fail_method = "GET" | .fail_path = "actions/runs/123/artifacts?per_page=100"'
+          else
+            change '.download_failure = true'
+          fi
+          invoke 1
+          check '(.issues | length) == 0 and (.comments | length) == 0'
+        done
+        go_reset
+        change '.artifacts[0].result.findings = []'
+        invoke 0
+        check '(.issues | length) == 0 and (.comments | length) == 0'
+        echo 'PASS 25: partial scan errors remain visible and API failures prevent writes'
+
+        # 요청: 첫 플랫폼 산출물의 여분 파일 뒤에 정상 경고. 기대: 정상 경고를 보고하고 손상 플랫폼만 판정 불가.
+        go_reset
+        change '.jobs += [(.jobs[0] | .id = 2 | .name = "dependency-scan (go/bcrypter/windows-cgo0)")] |
+          .artifacts += [(.artifacts[0] | .id = 8 | .name = "security-scan-go-bcrypter-windows-cgo0-attempt-2" |
+            .result.scan_key = "go-bcrypter-windows-cgo0" | .result.target.goos = "windows")] |
+          .artifacts[0].extra_file = true'
+        invoke 1
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | contains("GO-2026-0001") and contains("windows-cgo0") and contains("판정 불가") and contains("linux-cgo0"))'
+        echo 'PASS 26: corrupt artifact files cannot contaminate later valid targets'
+
+        # 7개 모듈 × 4개 환경의 실제 크기 job 목록에서 Windows 경고를 이슈 하나로 보고한다.
+        go_reset
+        change '[("bcrypter","scrypter","helloworld","jumin","jwter","timetool","portwho") as $mod |
+          ("linux-cgo0","linux-cgo1","macos-cgo1","windows-cgo0") as $cfg | {mod: $mod, cfg: $cfg}] as $matrix |
+          .jobs = [$matrix[] as $t | .jobs[0] | .name = "dependency-scan (go/\($t.mod)/\($t.cfg))" |
+            .html_url += "/\($t.mod)/\($t.cfg)" | .steps = [range(28) | {number: ., name: "Check dependency toolchain and scan prerequisites",
+              status: "completed", conclusion: "success", started_at: "2026-11-06T22:23:00Z", completed_at: "2026-11-06T22:24:00Z"}]] |
+          .artifacts = [$matrix[] as $t | .artifacts[0] |
+            .result |= (.module = $t.mod | .scan_key = "go-\($t.mod)-\($t.cfg)" |
+              .target.goos = (if $t.cfg == "macos-cgo1" then "darwin" else ($t.cfg | split("-")[0]) end) |
+              .target.cgo = $t.cfg[-1:] |
+              .findings = (if $t.cfg == "windows-cgo0" and ($t.mod == "bcrypter" or $t.mod == "scrypter") then
+                [(if $t.mod == "bcrypter" then "bmp" else "tiff" end) as $pkg | .findings[0] |
+                  .osv = "GO-TEST-0001" | .module = "golang.org/x/image" | .packages = ["golang.org/x/image/\($pkg)"] |
+                  .traces[0][0] |= (.module = "golang.org/x/image" | .package = "golang.org/x/image/\($pkg)")]
+                else [] end)) | .name = "security-scan-\(.result.scan_key)-attempt-2"]'
+        invoke 0
+        check '([.requests[] | select(.method == "DOWNLOAD")] | length) == 28 and
+          (.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | [split("\n")[] | select(contains("GO-TEST-0001"))] |
+            length == 1 and (.[0] | contains("golang.org/x/image/bmp") and contains("golang.org/x/image/tiff") and
+              contains("go/bcrypter/windows-cgo0") and contains("go/scrypter/windows-cgo0")))'
+        echo 'PASS 27: full Go matrix reports affected packages in one issue row'
+
+        # 요청: 28개 환경의 같은 경고 8/18건. 기대: 생성·갱신·복구가 본문 한도를 지키고 날짜별 한 번 알림.
+        jq '{jobs: [.jobs[] | .steps = []], artifacts}' "$fixture" > "$tmp/matrix.json"
+        for count in 8 18; do
+          change --argjson count "$count" --slurpfile matrix "$tmp/matrix.json" '
+            .jobs = $matrix[0].jobs | .artifacts = $matrix[0].artifacts |
+            .issues = [] | .comments = [] | .requests = [] |
+            .run.run_number = 10 | .run.created_at = "2026-11-06T22:23:00Z" | .fail_finalize = false |
+            .artifacts |= map(.workflow_run.id = 123 | .result.run_id = 123 |
+              .result.findings = [range($count) | {osv: "GO-TEST-\(.)", level: "module",
+              module: "stdlib", version: "v1.27.4", fixed_version: "v1.27.5", packages: [],
+              traces: [[{module: "stdlib", version: "v1.27.4"}]]}])'
+          invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            (.issues[0].body | length <= 65536 and contains("GO-TEST-") and contains("actions/runs/123"))'
+          if [ "$count" -gt 8 ]; then check '.issues[0].body | contains("본문 길이 제한")'; fi
+          # 큰 이전 본문에서 작은 새 결과로 바뀌어도 복구 마커가 본문 전체를 복제하면 갱신이 실패한다.
+          change '.run.run_number = 11 | .run.created_at = "2026-11-07T22:23:00Z" | .fail_finalize = true |
+            .jobs = [.jobs[0]] | .artifacts = [.artifacts[0]] |
+            .artifacts |= map(.workflow_run.id = 124 | .result.run_id = 124)'
+          GITHUB_RUN_ID=124 invoke 1
+          check '(.issues | length) == 1 and (.comments | length) == 1 and
+            (.issues[0].body | length <= 65536) and
+            ([.issues[0].body | scan("<!-- dependency-security-pending:([A-Za-z0-9+/=]+) -->")][0][0] |
+              @base64d | length < 500)'
+          change '.fail_finalize = false'
+          GITHUB_RUN_ID=124 invoke 0
+          GITHUB_RUN_ID=124 invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 2 and
+            (.issues[0].body | length <= 65536 and (contains("dependency-security-pending:") | not))'
+        done
+        echo 'PASS 28: large reports create, update and recover within GitHub body limits'
+
+        # 요청: 예전 전체 본문 형식의 pending 마커. 기대: 열린 이슈 복구, 닫힌 동일 검사 재전송 억제.
+        for state in open closed; do
+          reset; invoke 0
+          change --arg state "$state" '.issues[0] |= (.body as $old |
+            .state = $state | .body += "\n<!-- dependency-security-pending:\($old | @base64) -->")'
+          invoke 0
+          check '(.issues | length) == 1 and (.comments | length) == 1'
+        done
+        echo 'PASS 29: legacy full-body recovery markers remain compatible'
+
+        # 요청: 같은 취약점의 호출 확인·import 전용 패키지와 모듈 근거. 기대: symbol 행에는 호출 확인 패키지만 표시하고 모든 근거 보존.
+        go_reset
+        jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+          {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}},
+          ({module: "example.com/dep", version: "v1.0.0"} as $frame |
+            ([$frame], [$frame + {package: "example.com/dep/imported"}],
+              [$frame + {package: "example.com/dep/called", function: "Unsafe"},
+                {module: "example.com/app", package: "example.com/app", function: "Run"}]) |
+            {finding: {osv: "GO-TEST-MIXED", trace: .}})' > "$tmp/scanner.json"
+        scanner_status=0
+        (export GITHUB_OUTPUT="$tmp/scanner-output" SECURITY_RESULT_FILE="$tmp/result.json"
+          export GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa SECURITY_SCAN_KEY=go-bcrypter-linux-cgo0 SECURITY_MODULE=bcrypter
+          export GOOS=linux GOARCH=amd64 CGO_ENABLED=0
+          : > "$GITHUB_OUTPUT"
+          scan) > "$log" 2>&1
+        grep -qx 'vulnerable=true' "$tmp/scanner-output"
+        change --slurpfile result "$tmp/result.json" '.artifacts[0].result = $result[0] |
+          .jobs[0].conclusion = "failure" | .jobs[0].steps = [{name: "Fail for reachable vulnerabilities", conclusion: "failure"}]'
+        invoke 0
+        check '(.artifacts[0].result.findings | length) == 1 and
+          (.artifacts[0].result.findings[0] | .level == "symbol" and (.traces | length) == 3 and
+            (.packages | index("example.com/dep/imported") != null)) and
+          (.issues[0].body | contains("example.com/dep/called") and (contains("example.com/dep/imported") | not) and
+            (contains("example.com/app") | not))'
+        echo 'PASS 30: symbol reports list called packages and preserve weaker evidence in artifacts'
+
+        # 요청: 한글이 포함된 본문이 한도 직전의 행에서 잘림. 기대: 생성·갱신 본문은 안내와 로그 링크까지 UTF-8 60,000바이트 이하.
+        go_reset
+        change '.artifacts[0].result.findings = [range(80) as $i | .artifacts[0].result.findings[0] |
+          .osv = "GO-BUDGET-\(100 + $i)" | .fixed_version = "수정 버전 미제공"]'
+        invoke 0
+        padding=$(jq -j '.issues[0].body | split("\n") | reduce .[] as $line ({size: 0, done: false};
+          if .done then . else .size += ($line | utf8bytelength) + 1 |
+            .done = ($line | contains("| [GO-BUDGET-179]")) end) | 59950 - .size' "$fixture")
+        change --argjson padding "$padding" '.artifacts[0].result.findings[0] |=
+          (.module += ("x" * $padding) | .traces[0][0].module = .module) | .issues = [] | .comments = []'
+        invoke 0
+        check '.issues[0].body | utf8bytelength <= 60000 and startswith("<!-- dependency-security-issue:v1 -->") and
+          contains("본문 길이 제한") and contains("actions/runs/123/attempts/2")'
+        GITHUB_RUN_ATTEMPT=3 invoke 0
+        check '(.issues | length) == 1 and (.comments | length) == 1 and
+          (.issues[0].body | utf8bytelength <= 60000 and startswith("<!-- dependency-security-issue:v1 -->") and
+            contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
+        echo 'PASS 31: truncated bodies include the notice within the UTF-8 budget'
+
+        # 요청: 다른 스캔이 진행 중일 때 최종 jq 판정 오류. 기대: 오류 종료값 전달, 취약점 출력 없음, 다른 스캔 보존.
+        case "${OS:-}" in
+          Windows_NT) other_scan=$(mktemp -d -p "$(pwd -P)" .security-scan.XXXXXXXX) ;;
+          *) other_scan=$(mktemp -d "$(pwd -P)/.security-scan.XXXXXXXX") ;;
+        esac
+        scanner_status=0
+        jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+          {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}},
+          {finding: {osv: "GO-TEST-0001", trace: [{module: "example.com/dep", version: "v1.0.0", package: "example.com/dep/pkg", function: "Unsafe"}]}}' > "$tmp/scanner.json"
+        for mode in local ci; do
+          for jq_status in 1 2 3 4 5 127; do
+            : > "$tmp/scanner-output"
+            set +e
+            (
+              set -e
+              jq() {
+                case "$1" in
+                  -e|-je) echo 'Final jq assessment failed' >&2; return "$jq_status" ;;
+                esac
+                command jq "$@"
+              }
+              export SECURITY_RESULT_FILE="$tmp/result.json"
+              if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$tmp/scanner-output"; else unset GITHUB_OUTPUT; fi
+              cd "$tmp/module"
+              scan
+            ) > "$log" 2>&1
+            result=$?
+            set -e
+            if [ "$result" -ne "$jq_status" ]; then
+              cat "$log"
+              echo "FAIL final jq $mode: expected $jq_status got $result"
+              exit 1
+            fi
+            grep -qx 'Final jq assessment failed' "$log"
+            test ! -s "$tmp/scanner-output"
+            jq -e '.findings[0].level == "symbol"' "$tmp/result.json" > /dev/null
+            for leftover in "$tmp/module"/.security-scan.*; do
+              if [ -d "$leftover" ]; then echo "Scanner temp directory leaked: $leftover"; exit 1; fi
+            done
+          done
+        done
+        echo 'PASS 32: final jq errors fail local and CI scans without vulnerability output'
+        test -d "$other_scan"
+        rmdir "$other_scan"
+        unset other_scan
+
+        # 요청: Go 검사 작업 판별 jq 오류. 기대: 원래 종료값으로 실패하고 다운로드·이슈·댓글 없음.
+        for jq_status in 1 2 3 4 5 127; do
+          go_reset
+          (
+            jq() {
+              case "$1" in
+                -e|-je)
+                  case "${2:-}" in
+                    'any(.[]; .name | startswith("dependency-scan (go/"))'*)
+                      echo 'Go job assessment failed' >&2
+                      return "$jq_status" ;;
+                  esac ;;
+              esac
+              command jq "$@"
+            }
+            invoke "$jq_status"
+            check '(.issues | length) == 0 and (.comments | length) == 0 and all(.requests[]; .method == "GET")'
+            grep -qx 'Go job assessment failed' "$log"
+          )
+        done
+        echo 'PASS 33: Go job assessment errors fail reporting before downloads and issue writes'
+
+        # 판정이나 본문 작성 도중 실패하면 경고를 누락하거나 이슈를 중복 생성하지 않는다.
+        for stage in unknown findings tempdir identity status artifact conclusion summary handled create pending finalize comment; do
+          go_reset
+          case "$stage" in
+            unknown) change '.artifacts = []' ;;
+            findings) reset; change '.jobs[0].name = "dependency-scan (npm)"' ;;
+            handled) invoke 0; change '.requests = [] | .close_before_patch = 42' ;;
+            pending|finalize) invoke 0; change '.requests = []' ;;
+          esac
+          (
+            cd "$tmp/module"
+            jq() {
+              case "$stage|$1|$PWD" in
+                tempdir\|-Rj\|*.security-report.*) echo 'Injected report failure' >&2; return 2 ;;
+              esac
+              case "$stage|$*" in
+                'unknown|'*' length'|'findings|'*' length | tostring'|'status|'*' .status'|\
+                'identity|'*'.name | capture('*|'artifact|'*'def evidence_level:'*|'conclusion|'*'$job.conclusion == "success"'*|\
+                'summary|'*'"- Go 보고 항목:'*|'handled|'*' .handled | tostring')
+                  echo 'Injected report failure' >&2
+                  return 2 ;;
+                'create|'*'{title: '*|'pending|'*'{body: (. + '*|'finalize|'*'{body: .}'|'comment|'*'{body: $body}')
+                  command jq "$@"
+                  echo 'Injected report failure' >&2
+                  return 2 ;;
+              esac
+              command jq "$@"
+            }
+            invoke 2
+            grep -qx 'Injected report failure' "$log"
+            for leftover in .security-report.*; do
+              if [ -d "$leftover" ]; then echo "Report temp directory leaked: $leftover"; exit 1; fi
+            done
+            case "$stage" in
+              handled) check '(.issues | length) == 1 and (.comments | length) == 1 and
+                all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+              pending) check 'all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+              finalize) check '[.requests[] | select(.method == "PATCH")] | length == 1' ;;
+              comment) check '(.issues | length) == 1 and (.comments | length) == 0 and
+                all(.requests[]; .method != "POST" or .path == "issues")' ;;
+              *) check '(.issues | length) == 0 and (.comments | length) == 0 and
+                all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+            esac
+          )
+        done
+        echo 'PASS 34: report errors propagate without duplicate or partial findings'
+
+        # 자식 테스트가 첫 보고에서 중단돼도 호출자가 넘긴 빈 디렉터리를 보존한다.
+        jq -n --arg source {{.TASKFILE_DIR | shellQuote}}/Taskfile.yml \
+          '{version: "3", silent: true, includes: {shared: {taskfile: $source, dir: ".", flatten: true}},
+            tasks: {entry: {cmds: [{task: "security:test", vars: {SECURITY_REPORT: "exit 87"}}]}}}' > "$tmp/Taskfile.entry.yml"
+        set +e
+        other_scan="$tmp/module" task --silent --exit-code --taskfile "$tmp/Taskfile.entry.yml" entry > "$log" 2>&1
+        result=$?
+        set -e
+        test "$result" -eq 1
+        grep -Fq 'Expected exit 0; got 87' "$log"
+        test -d "$tmp/module"
+        echo 'PASS 35: early test failure preserves the caller directory'

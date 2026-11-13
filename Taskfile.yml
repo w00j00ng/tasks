@@ -10,13 +10,89 @@ includes:
 
 vars:
   SECURITY_SCAN: |
+    set -euo pipefail
+    export CGO_ENABLED=${CGO_ENABLED:-0}
+    # Task uses Go coreutils on Windows; BSD mktemp needs an absolute template.
+    case "${OS:-}" in
+      Windows_NT) scan_tmp=$(mktemp -d -p "$(pwd -P)" .security-scan.XXXXXXXX) ;;
+      *) scan_tmp=$(mktemp -d "$(pwd -P)/.security-scan.XXXXXXXX") ;;
+    esac
+    trap 'rm -f "$scan_tmp/raw.json" "$scan_tmp/parsed.json" "$scan_tmp/result.json"; rmdir "$scan_tmp"' EXIT
+    result_file=${SECURITY_RESULT_FILE:-$scan_tmp/result.json}
+    target='{}'
+    scan_status=error
     status=0
-    govulncheck -test -show verbose ./... || status=$?
-    if [ "$status" -eq 3 ] && [ -n "${GITHUB_OUTPUT:-}" ]; then
-      printf 'vulnerable=true\n' >> "$GITHUB_OUTPUT"
-    else
-      exit "$status"
+    scanner_exit=null
+    target=$(go env -json GOOS GOARCH CGO_ENABLED GOVERSION) || { status=$?; target='{}'; }
+    if [ "$status" -eq 0 ]; then
+      scanner_exit=0
+      govulncheck -json -test ./... > "$scan_tmp/raw.json" || scanner_exit=$?
+      status=$scanner_exit
     fi
+    if [ "$status" -eq 0 ]; then
+      if jq -se '
+        def text: type == "string" and length > 0;
+        def frame:
+          type == "object" and
+          all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
+          ((.version // "") == "" or (.module | text)) and
+          ((.package // "") == "" or (.module | text)) and
+          ((.function // "") == "" or (.package | text));
+        if ([.[] | select(has("config"))] | length) != 1 or ([.[] | select(has("SBOM"))] | length) != 1 or
+          (all(.[]; type == "object" and (keys | length) == 1 and
+            (has("config") or has("SBOM") or has("osv") or has("progress") or has("finding"))) | not) then
+          error("incomplete govulncheck JSON") else . end |
+        ([.[] | .config? // empty][0]) as $config |
+        ([.[] | .SBOM? // empty][0]) as $sbom |
+        if $config.protocol_version != "v1.0.0" or $config.scanner_name != "govulncheck" or
+          ($config.scanner_version | text | not) or $config.scan_level != "symbol" or $config.scan_mode != "source" or
+          ($sbom.go_version | text | not) or ($sbom.modules | type) != "array" or ($sbom.roots | type) != "array" then
+          error("invalid source/symbol scan configuration or SBOM") else . end |
+        [.[] | select(has("finding")) | .finding |
+          if type == "object" and (.osv | text) and (.trace | type == "array" and length > 0) and
+            (.trace[0].module | text) and (.trace[0].version | text) and
+            (.fixed_version == null or (.fixed_version | type == "string")) and
+            all(.trace[]; frame) and (.trace | length == 1 or (.[0].function | text)) then . else error("invalid finding") end |
+          {osv, module: .trace[0].module, version: .trace[0].version, fixed_version: (.fixed_version // ""),
+           level: (if (.trace[0].function // "") != "" then "symbol" elif (.trace[0].package // "") != "" then "package" else "module" end),
+           packages: [.trace[] | .package? // empty | select(length > 0)], traces: [.trace]}] |
+        group_by([.osv, .module, .version]) | map(. as $all |
+          (max_by(if .level == "symbol" then 3 elif .level == "package" then 2 else 1 end)) +
+          {packages: ([$all[].packages[]] | unique), traces: ([$all[].traces[]] | unique)}) |
+        {scanner_version: $config.scanner_version, findings: .}' "$scan_tmp/raw.json" > "$scan_tmp/parsed.json"; then
+        scan_status=complete
+      else
+        status=1
+      fi
+    fi
+    if [ "$scan_status" = error ]; then
+      printf '{"scanner_version":"","findings":[]}\n' > "$scan_tmp/parsed.json"
+      printf 'Go vulnerability scan failed (exit %s).\n' "$status" >&2
+    fi
+    jq -n --arg repository "${GITHUB_REPOSITORY:-}" --arg sha "${GITHUB_SHA:-}" \
+      --argjson run "${GITHUB_RUN_ID:-0}" --argjson attempt "${GITHUB_RUN_ATTEMPT:-0}" \
+      --arg scan_key "${SECURITY_SCAN_KEY:-local}" --arg module "${SECURITY_MODULE:-.}" \
+      --argjson target "$target" --arg scan_status "$scan_status" --argjson scanner_exit "$scanner_exit" \
+      --slurpfile parsed "$scan_tmp/parsed.json" \
+      '{schema_version: 1, repository: $repository, head_sha: $sha, run_id: $run, run_attempt: $attempt,
+        scan_key: $scan_key, module: $module, target: {goos: ($target.GOOS // ""), goarch: ($target.GOARCH // ""), cgo: ($target.CGO_ENABLED // "")},
+        go_version: ($target.GOVERSION // ""), scanner_version: $parsed[0].scanner_version,
+        scan_status: $scan_status, scanner_exit: $scanner_exit, findings: $parsed[0].findings}' > "$result_file"
+    cat "$result_file"
+    if [ "$status" -eq 0 ]; then
+      vulnerable=$(jq -je 'any(.findings[]; .level == "symbol") | tostring' "$result_file") || status=$?
+      if [ "$status" -eq 0 ] && [ "$vulnerable" = true ]; then
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          printf 'vulnerable=true\n' >> "$GITHUB_OUTPUT"
+        else
+          status=3
+        fi
+      fi
+    fi
+    rm -f "$scan_tmp/raw.json" "$scan_tmp/parsed.json" "$scan_tmp/result.json"
+    rmdir "$scan_tmp"
+    trap - EXIT
+    exit "$status"
 
   SECURITY_NPM: |
     status=0
@@ -58,32 +134,185 @@ vars:
     jobs=$(api GET "actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" --paginate --slurp |
       jq --argjson attempt "$GITHUB_RUN_ATTEMPT" '[.[].jobs[] |
         select((.name | startswith("dependency-scan (")) and (.run_attempt // 1) <= $attempt)] |
-        group_by(.name) | map(max_by([.run_attempt // 1, .id // 0])) |
-        map(select(.status == "completed"))')
+        group_by(.name) | map(max_by([.run_attempt // 1, .id // 0]) |
+          {name, run_attempt, status, conclusion, html_url, gate_failed:
+            any(.steps[]?; .name == "Fail for reachable vulnerabilities" and .conclusion == "failure")})')
+    sha=$(printf '%s' "$run" | jq -je '.head_sha | strings | select(length > 0)')
+    go_findings='[]'
+    unknown='[]'
+    has_go=$(printf '%s' "$jobs" | jq -je 'any(.[]; .name | startswith("dependency-scan (go/")) | tostring')
+    collect_go_results() {
+      download_dir="$report_tmp/artifact"
+      : > "$report_tmp/findings.jsonl"
+      encoded_jobs=$(printf '%s' "$jobs" | jq -jr '.[] | select(.name | startswith("dependency-scan (go/")) | @base64 + " "')
+      for encoded in $encoded_jobs; do
+        job=$(printf '%s' "$encoded" | jq -Rj '@base64d')
+        name=$(printf '%s' "$job" | jq -j .name)
+        identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go/(?<module>[A-Za-z0-9_.-]+)/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")')
+        module=$(printf '%s' "$identity" | jq -j .module)
+        config=$(printf '%s' "$identity" | jq -j .config)
+        scan_key="go-$module-$config"
+        scan_attempt=$(printf '%s' "$job" | jq -je '.run_attempt // 1 | numbers | tostring')
+        artifact_name="security-scan-$scan_key-attempt-$scan_attempt"
+        valid=$(printf '%s' "$artifacts" | jq -j --arg name "$artifact_name" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" '
+          [.[] | select(.name == $name)] | length == 1 and
+          (.[0] | .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha) | tostring')
+        job_status=$(printf '%s' "$job" | jq -j .status)
+        if [ "$valid" != true ] || [ "$job_status" != completed ]; then
+          unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+          continue
+        fi
+        mkdir "$download_dir"
+        gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact_name" --dir "$download_dir" >&2
+        case "$config" in
+          linux-*) expected_os=linux ;;
+          windows-*) expected_os=windows ;;
+          macos-*) expected_os=darwin ;;
+        esac
+        expected_cgo=${config##*cgo}
+        entries=0
+        for entry in "$download_dir"/* "$download_dir"/.[!.]* "$download_dir"/..?*; do
+          if [ -e "$entry" ] || [ -L "$entry" ]; then entries=$((entries + 1)); fi
+        done
+        result_file="$download_dir/security-result.json"
+        valid_result=false
+        if [ "$entries" -eq 1 ] && [ -f "$result_file" ] && [ ! -L "$result_file" ]; then
+          valid_result=$(jq -Rjse --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
+            --argjson attempt "$scan_attempt" --arg key "$scan_key" --arg module "$module" --arg os "$expected_os" --arg cgo "$expected_cgo" '
+            def text: type == "string" and length > 0;
+            def frame:
+              type == "object" and
+              all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
+              ((.version // "") == "" or (.module | text)) and
+              ((.package // "") == "" or (.module | text)) and
+              ((.function // "") == "" or (.package | text));
+            def evidence_level:
+              if any(.traces[][0]; (.function // "") != "") then "symbol"
+              elif any(.traces[][0]; (.package // "") != "") then "package"
+              else "module" end;
+            def valid_result:
+            .schema_version == 1 and .repository == $repository and .head_sha == $sha and .run_id == $run and
+            .run_attempt == $attempt and .scan_key == $key and .module == $module and
+            .target.goos == $os and .target.cgo == $cgo and (.target.goarch | strings | test("^[a-z0-9]+$")) and
+            (.go_version | text) and (.scanner_version | text) and .scan_status == "complete" and .scanner_exit == 0 and
+            (.findings | type == "array") and all(.findings[];
+              (.osv | text) and
+              (.module | text) and (.version | text) and (.fixed_version | type == "string") and
+              (.packages | type == "array") and all(.packages[]; text) and
+              (.traces | type == "array" and length > 0) and (. as $finding |
+                all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
+                  all(.[]; frame) and (length == 1 or (.[0].function | text)))) and
+              .level == evidence_level);
+            (try (fromjson | valid_result) catch false) // false | tostring' "$result_file")
+        fi
+        if [ "$valid_result" = true ]; then
+          consistent=$(jq -je --argjson job "$job" '($job.conclusion == "success" or ($job.conclusion == "failure" and
+            $job.gate_failed and any(.findings[]; .level == "symbol"))) | tostring' "$result_file")
+          jq -c --argjson job "$job" '.target as $target | .findings[] |
+            {osv, module, version, level, fixed_version, target: $target, job: ($job | {name, html_url}),
+             packages: ([. as $finding | .traces[][0] |
+               select($finding.level != "symbol" or (.function // "") != "") |
+               .package | select(type == "string" and length > 0)] | unique)}' \
+            "$result_file" >> "$report_tmp/findings.jsonl"
+          if [ "$consistent" != true ]; then
+            unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+          fi
+        else
+          unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+        fi
+        rm -rf -- "$download_dir"
+      done
+      jq -cjs --argjson unknown "$unknown" 'group_by([.osv, .module, .version, .level]) | map(.[0] + {
+        targets: (map(.target) | unique), jobs: (map(.job) | unique_by([.name, .html_url])),
+        packages: ([.[].packages[]] | unique),
+        fixed_versions: (map(if .fixed_version == "" then "미제공" else .fixed_version end) | unique)}) |
+        {findings: ., unknown: $unknown}' "$report_tmp/findings.jsonl"
+    }
+    if [ "$has_go" = true ]; then
+      artifacts=$(api GET "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp | jq '[.[].artifacts[]]')
+      report_root=$(pwd -P | jq -Rj 'gsub("\\\\"; "/")')
+      case "${OS:-}" in
+        Windows_NT) allocated_dir=$(mktemp -d -p "$report_root" .security-report.XXXXXXXX) ;;
+        *) allocated_dir=$(mktemp -d "$report_root/.security-report.XXXXXXXX") ;;
+      esac
+      report_tmp=$(cd "$allocated_dir" && pwd -P | jq -Rj 'gsub("\\\\"; "/")') || {
+        status=$?; rmdir "$allocated_dir" || :; exit "$status"
+      }
+      case "$report_tmp" in "$report_root"/.security-report.*) ;; *) rmdir "$allocated_dir" || :; exit 1 ;; esac
+      trap 'rm -rf -- "$report_tmp"' EXIT
+      # Task's shell can skip EXIT cleanup on errexit inside a command substitution.
+      set +e
+      summary=$(set -e; collect_go_results)
+      status=$?
+      rm -rf -- "$report_tmp"
+      cleanup_status=$?
+      trap - EXIT
+      set -e
+      if [ "$status" -ne 0 ]; then exit "$status"; fi
+      if [ "$cleanup_status" -ne 0 ]; then exit "$cleanup_status"; fi
+      unknown=$(printf '%s' "$summary" | jq -cj .unknown)
+      go_findings=$(printf '%s' "$summary" | jq -cj .findings)
+    fi
+    report_status=0
+    unknown_count=$(printf '%s' "$unknown" | jq -je 'length')
+    if [ "$unknown_count" -gt 0 ]; then
+      report_status=1
+      unknown_names=$(printf '%s' "$unknown" | jq -j 'join(", ")')
+      printf 'Go scan results unknown: %s\n' "$unknown_names" >&2
+    fi
     findings=$(printf '%s' "$jobs" | jq '[.[] | select(.conclusion == "failure" and
-      any(.steps[]?; .name == "Fail for reachable vulnerabilities" and .conclusion == "failure"))]')
-    if [ "$(printf '%s' "$findings" | jq -j 'length | tostring')" -eq 0 ]; then
-      exit 0
+      (.name | startswith("dependency-scan (go/") | not) and
+      .gate_failed)]')
+    finding_count=$(printf '%s' "$findings" | jq -je 'length | tostring')
+    if [ "$finding_count" -eq 0 ] && [ "$go_findings" = '[]' ]; then
+      exit "$report_status"
     fi
     run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
     scanned_at=$(printf '%s' "$run" | jq -j '.created_at | fromdateiso8601 + (9 * 3600) | strftime("%Y-%m-%d %H:%M")')
     day=${scanned_at%% *}
-    sha=$(printf '%s' "$run" | jq -j .head_sha)
     marker='<!-- dependency-security-issue:v1 -->'
     run_number=$(printf '%s' "$run" | jq -je '.run_number | numbers | tostring')
     source="<!-- dependency-security-source:$sha:$GITHUB_RUN_ID -->"
-    body=$(printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
-      'main 정기 의존성 검사에서 기준 이상의 보안 취약점이 발견되었습니다.' '' \
-      "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)" '' \
-      '| 취약점 발견 모듈 | 상세 결과 |' '| --- | --- |'
-      printf '%s' "$findings" | jq -r 'sort_by(.name)[] | "| \(.name) | [검사 결과](\(.html_url)) |"'
-      errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
-        '[.[] | select(.conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] | join(", ")')
+    errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
+      --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") | not) and
+        .conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] + $unknown | join(", ")')
+    body=$(set -e
+      printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
+      'main 정기 의존성 검사에서 보안 점검 결과가 발견되었습니다.' '' \
+      "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)"
+      printf '%s' "$go_findings" | jq -r '"- Go 보고 항목: 호출 경로 확인 \([.[] | select(.level == "symbol")] | length)건, 의존성 업데이트 경고 \([.[] | select(.level != "symbol")] | length)건"'
       if [ -n "$errors" ]; then
-        printf '\n다음 모듈은 검사 오류로 판정하지 못했습니다: %s.\n' "$errors"
+        printf '\n다음 모듈은 검사 오류로 판정 불가입니다: %s.\n' "$errors"
       fi
+      printf '\n%s\n\n' '### 호출 경로에서 확인된 Go 취약점'
+      printf '%s\n' \
+      '| OSV | 의존성 | 영향 패키지 | 발견 / 수정 버전 | 대상 | 검사 |' '| --- | --- | --- | --- | --- | --- |'
+      printf '%s' "$go_findings" | jq -r '.[] | select(.level == "symbol") |
+        "| [\(.osv)](https://osv.dev/vulnerability/\(.osv)) | \(.module) | \(.packages | join(", ")) | \(.version) / \(.fixed_versions | join(", ")) | \(.targets | map("\(.goos)/\(.goarch), cgo=\(.cgo)") | join("; ")) | \(.jobs | map("[\(.name)](\(.html_url))") | join("; ")) |"'
+      printf '\n%s\n\n%s\n%s\n' '### 의존성 업데이트 경고 (package/module)' \
+        '아래 결과는 현재 검사 대상의 호출 경로에서 사용이 확인되지 않았습니다. 의존성 업데이트를 검토해 주세요.' \
+        '| OSV | 수준 / 의존성 | 영향 패키지 | 발견 / 수정 버전 | 대상 | 검사 |'
+      printf '%s\n' '| --- | --- | --- | --- | --- | --- |'
+      printf '%s' "$go_findings" | jq -r '.[] | select(.level != "symbol") |
+        "| [\(.osv)](https://osv.dev/vulnerability/\(.osv)) | \(.level) / \(.module) | \(.packages | join(", ")) | \(.version) / \(.fixed_versions | join(", ")) | \(.targets | map("\(.goos)/\(.goarch), cgo=\(.cgo)") | join("; ")) | \(.jobs | map("[\(.name)](\(.html_url))") | join("; ")) |"'
+      printf '\n%s\n\n%s\n%s\n' '### npm 및 기존 검사 규약' \
+        'npm은 high/critical 심각도를 기준으로 하며 Go 호출 경로 분석과 구분합니다.' \
+        '| 취약점 발견 모듈 | 상세 결과 |'
+      printf '%s\n' '| --- | --- |'
+      printf '%s' "$findings" | jq -r 'sort_by(.name)[] | "| \(.name) | [검사 결과](\(.html_url)) |"'
       printf '\n%s\n%s\n' '검사 범위와 취약점 상세는 연결된 검사 로그를 확인해 주세요.' \
         '본문은 최근 발견 결과로 갱신하며 알림은 별도 댓글로 남깁니다. 조치 완료 후 이슈를 닫아 주세요. 이후 발견 시 새 이슈를 생성합니다.')
+    # Reserve room for recovery metadata inside GitHub's 65,536-character body limit.
+    # Binary output keeps Windows newline conversion from exceeding the UTF-8 budget.
+    body=$(printf '%s' "$body" | jq -bRsj --arg url "$run_url" '
+      if utf8bytelength <= 60000 then . else
+        ("\n본문 길이 제한으로 일부 결과를 생략했습니다. 전체 결과는 [검사 로그](" + $url + ")에서 확인해 주세요.") as $notice |
+        (60000 - ($notice | utf8bytelength)) as $limit |
+        reduce split("\n")[] as $line ({body: "", full: false};
+          if .full then . elif ((.body | utf8bytelength) + ($line | utf8bytelength) + 1) <= $limit
+          then .body += $line + "\n" else .full = true end) |
+        .body + $notice
+      end')
     issues=$(api GET 'issues?state=all&creator=github-actions%5Bbot%5D&per_page=100' --paginate --slurp |
       jq --arg marker "$marker" --arg source "$source" --arg sha "$sha" \
         --arg path "/actions/runs/$GITHUB_RUN_ID/" --argjson run "$run_number" '
@@ -97,35 +326,42 @@ vars:
     # Retries keep the same commit and run ID. The next scheduled run has a new ID.
     replayed=$(printf '%s' "$issues" | jq -j 'any(.[]; .state == "closed" and .handled) | tostring')
     if [ "$replayed" = true ]; then
-      exit 0
+      exit "$report_status"
     fi
     existing=$(printf '%s' "$issues" | jq '[.[] | select(.state == "open")][0] // {}')
     outdated=$(printf '%s' "$existing" | jq -j --argjson run "$run_number" --argjson attempt "$GITHUB_RUN_ATTEMPT" '
       [(.body // "" | scan("<!-- dependency-security-run:([0-9]+):([0-9]+) -->")) | map(tonumber)] |
       any(.[]; . > [$run, $attempt]) | tostring')
     if [ "$outdated" = true ]; then
-      exit 0
+      exit "$report_status"
     fi
     number=$(printf '%s' "$existing" | jq -j '.number // empty | tostring')
     if [ -n "$number" ]; then
-      # Keep the last completed report until GitHub confirms this update reached an open issue.
-      previous=$(printf '%s' "$existing" | jq -j '.reported | @base64')
-      issue=$(jq -n --arg body "$body" --arg previous "$previous" \
-        '{body: ($body + "\n<!-- dependency-security-pending:" + $previous + " -->")}' |
-        api PATCH "issues/$number" --input -)
+      handled=$(printf '%s' "$existing" | jq -je '.handled | tostring')
+      # Only scan identity is needed to recover an update interrupted by closure or API failure.
+      previous=$(printf '%s' "$existing" | jq -j '.reported | [
+        ([match("<!-- dependency-security-run:[0-9]+:[0-9]+ -->").string][0] // ""),
+        ([match("<!-- dependency-security-source:[0-9a-f]{40}:[0-9]+ -->").string][0] // ""),
+        ([match("[0-9a-f]{40}").string][0] // ""),
+        ([match("/actions/runs/[0-9]+/").string][0] // "")
+        ] | join("\n") | @base64')
+      payload=$(printf '%s' "$body" | jq -Rs --arg previous "$previous" \
+        '{body: (. + "\n<!-- dependency-security-pending:" + $previous + " -->")}')
+      issue=$(printf '%s' "$payload" | api PATCH "issues/$number" --input -)
       state=$(printf '%s' "$issue" | jq -je '.state | select(. == "open" or . == "closed")')
       if [ "$state" = open ]; then
-        jq -n --arg body "$body" '{body: $body}' | api PATCH "issues/$number" --input - > /dev/null
+        payload=$(printf '%s' "$body" | jq -Rs '{body: .}')
+        printf '%s' "$payload" | api PATCH "issues/$number" --input - > /dev/null
       else
-        if [ "$(printf '%s' "$existing" | jq -j '.handled | tostring')" = true ]; then
-          exit 0
+        if [ "$handled" = true ]; then
+          exit "$report_status"
         fi
         number=
       fi
     fi
     if [ -z "$number" ]; then
-      issue=$(jq -n --arg body "$body" '{title: "의존성 보안 취약점 정기 검사", body: $body}' |
-        api POST issues --input -)
+      payload=$(printf '%s' "$body" | jq -Rs '{title: "의존성 보안 취약점 정기 검사", body: .}')
+      issue=$(printf '%s' "$payload" | api POST issues --input -)
       number=$(printf '%s' "$issue" | jq -je '.number | numbers | tostring')
     fi
     day_marker="<!-- dependency-security-alert:$day -->"
@@ -134,19 +370,22 @@ vars:
       'any(.[][]; .user.login == "github-actions[bot]" and ((.body // "") | contains($marker))) | tostring')
     if [ "$notified" != true ]; then
       comment=$(printf '%s\n%s' "$day_marker" \
-        "@w00j00ng $day KST 정기 검사에서 보안 취약점이 발견되었습니다. [검사 결과]($run_url)와 갱신된 본문을 확인해 주세요.")
-      jq -n --arg body "$comment" '{body: $body}' | api POST "issues/$number/comments" --input - > /dev/null
+        "@w00j00ng $day KST 정기 의존성 검사에서 확인할 보안 점검 결과가 있습니다. [검사 결과]($run_url)와 갱신된 본문을 확인해 주세요.")
+      payload=$(jq -n --arg body "$comment" '{body: $body}')
+      printf '%s' "$payload" | api POST "issues/$number/comments" --input - > /dev/null
     fi
+    exit "$report_status"
 
 tasks:
   security:scan:
-    desc: Scan one module; mark confirmed CI findings or return the scanner exit code locally
+    desc: Scan one Go module; only symbol findings block CI or return 3 locally
     dir: '{{.ROOT_DIR}}/{{.MODULE}}'
     requires:
       vars:
         - MODULE
     env:
-      CGO_ENABLED: '0'
+      CGO_ENABLED: '{{env "CGO_ENABLED" | default "0"}}'
+      SECURITY_MODULE: '{{.MODULE}}'
     cmds:
       - '{{.SECURITY_SCAN}}'
 
