@@ -815,3 +815,41 @@ tasks:
           (.issues[0].body | utf8bytelength <= 60000 and startswith("<!-- dependency-security-issue:v1 -->") and
             contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
         echo 'PASS 31: truncated bodies include the notice within the UTF-8 budget'
+
+        # 요청: symbol 결과의 최종 jq 판정 오류. 기대: 로컬·CI 모두 오류 종료값을 전달하고 취약점 출력 없음.
+        scanner_status=0
+        jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
+          {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}},
+          {finding: {osv: "GO-TEST-0001", trace: [{module: "example.com/dep", version: "v1.0.0", package: "example.com/dep/pkg", function: "Unsafe"}]}}' > "$tmp/scanner.json"
+        for mode in local ci; do
+          for jq_status in 1 2 3 4 5 127; do
+            : > "$tmp/scanner-output"
+            set +e
+            (
+              set -e
+              jq() {
+                case "$1" in
+                  -e|-je) echo 'Final jq assessment failed' >&2; return "$jq_status" ;;
+                esac
+                command jq "$@"
+              }
+              export SECURITY_RESULT_FILE="$tmp/result.json"
+              if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$tmp/scanner-output"; else unset GITHUB_OUTPUT; fi
+              scan
+            ) > "$log" 2>&1
+            result=$?
+            set -e
+            if [ "$result" -ne "$jq_status" ]; then
+              cat "$log"
+              echo "FAIL final jq $mode: expected $jq_status got $result"
+              exit 1
+            fi
+            grep -qx 'Final jq assessment failed' "$log"
+            test ! -s "$tmp/scanner-output"
+            jq -e '.findings[0].level == "symbol"' "$tmp/result.json" > /dev/null
+            for leftover in .security-scan.*; do
+              if [ -d "$leftover" ]; then echo "Scanner temp directory leaked: $leftover"; exit 1; fi
+            done
+          done
+        done
+        echo 'PASS 32: final jq errors fail local and CI scans without vulnerability output'

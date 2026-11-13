@@ -79,11 +79,14 @@ vars:
         go_version: ($target.GOVERSION // ""), scanner_version: $parsed[0].scanner_version,
         scan_status: $scan_status, scanner_exit: $scanner_exit, findings: $parsed[0].findings}' > "$result_file"
     cat "$result_file"
-    if [ "$status" -eq 0 ] && jq -e 'any(.findings[]; .level == "symbol")' "$result_file" > /dev/null; then
-      if [ -n "${GITHUB_OUTPUT:-}" ]; then
-        printf 'vulnerable=true\n' >> "$GITHUB_OUTPUT"
-      else
-        status=3
+    if [ "$status" -eq 0 ]; then
+      vulnerable=$(jq -je 'any(.findings[]; .level == "symbol") | tostring' "$result_file") || status=$?
+      if [ "$status" -eq 0 ] && [ "$vulnerable" = true ]; then
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          printf 'vulnerable=true\n' >> "$GITHUB_OUTPUT"
+        else
+          status=3
+        fi
       fi
     fi
     rm -f "$scan_tmp/raw.json" "$scan_tmp/parsed.json" "$scan_tmp/result.json"
