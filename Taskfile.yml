@@ -94,6 +94,53 @@ vars:
     trap - EXIT
     exit "$status"
 
+  SECURITY_SCAN_BATCH: |
+    set -euo pipefail
+    case "$SECURITY_BATCH_TARGET" in
+      linux-cgo0|linux-cgo1|windows-cgo0|macos-cgo1) ;;
+      *) echo 'Invalid batch target' >&2; exit 1 ;;
+    esac
+    modules=$(printf '%s' "$SECURITY_MODULES" | jq -Rjse '
+      [splits("\\s+") | select(length > 0)] |
+      if length > 0 and (unique | length) == length and
+        all(.[]; test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))
+      then . else error("expected unique module directory names") end')
+    if [ -e "$SECURITY_RESULT_DIR" ] || [ -L "$SECURITY_RESULT_DIR" ]; then
+      echo 'Batch result directory already exists' >&2
+      exit 1
+    fi
+    mkdir "$SECURITY_RESULT_DIR"
+    result_root=$(cd "$SECURITY_RESULT_DIR" && pwd -P)
+    jq -n --argjson modules "$modules" '{schema_version: 1, modules: $modules}' > "$result_root/manifest.json"
+    module_names=$(printf '%s' "$modules" | jq -jr '.[] | . + " "')
+    status=0
+    vulnerable=false
+    for module in $module_names; do
+      mkdir "$result_root/$module"
+      result_file="$result_root/$module/security-result.json"
+      module_status=0
+      GITHUB_OUTPUT= SECURITY_RESULT_FILE="$result_file" SECURITY_SCAN_KEY="go-$module-$SECURITY_BATCH_TARGET" \
+        task --dir "$SECURITY_ROOT_DIR" --silent --exit-code security:scan MODULE="$module" || module_status=$?
+      printf '%s\n' "$module_status" > "$result_root/$module/exit-code"
+      assessment=$(jq -Rjse '(try (fromjson |
+        if .scan_status == "complete" and .scanner_exit == 0 and (.findings | type == "array")
+        then if any(.findings[]; .level == "symbol") then "symbol" else "clean" end
+        else "error" end) catch "error")' "$result_file") || { status=1; continue; }
+      if [ "$assessment" = symbol ]; then vulnerable=true; fi
+      if [ "$assessment" = error ] || { [ "$module_status" -ne 0 ] && [ "$module_status" -ne 3 ]; } ||
+        { [ "$module_status" -eq 3 ] && [ "$assessment" != symbol ]; }; then
+        status=1
+      fi
+    done
+    if [ "$vulnerable" = true ]; then
+      if [ -n "${GITHUB_OUTPUT:-}" ]; then
+        printf 'vulnerable=true\n' >> "$GITHUB_OUTPUT"
+      elif [ "$status" -eq 0 ]; then
+        status=3
+      fi
+    fi
+    exit "$status"
+
   SECURITY_NPM: |
     status=0
     audit=$(npm audit --package-lock-only --include=dev --audit-level=high --registry=https://registry.npmjs.org --json) || status=$?
@@ -140,18 +187,98 @@ vars:
     sha=$(printf '%s' "$run" | jq -je '.head_sha | strings | select(length > 0)')
     go_findings='[]'
     unknown='[]'
-    has_go=$(printf '%s' "$jobs" | jq -je 'any(.[]; .name | startswith("dependency-scan (go/")) | tostring')
+    has_go=$(printf '%s' "$jobs" | jq -je 'any(.[]; .name | startswith("dependency-scan (go/")) or any(.[]; .name | startswith("dependency-scan (go-batch/")) | tostring')
+    read_go_result() {
+      entries=0
+      for entry in "$result_dir"/* "$result_dir"/.[!.]* "$result_dir"/..?*; do
+        if [ -e "$entry" ] || [ -L "$entry" ]; then entries=$((entries + 1)); fi
+      done
+      result_file="$result_dir/security-result.json"
+      result_entries=1
+      module_exit=unknown
+      if [ "$is_batch" = true ]; then
+        if [ -e "$result_dir/exit-code" ] || [ -L "$result_dir/exit-code" ]; then result_entries=2; fi
+        if [ -f "$result_dir/exit-code" ] && [ ! -L "$result_dir/exit-code" ]; then
+          module_exit=$(cat "$result_dir/exit-code")
+        fi
+      fi
+      valid_result=false
+      if [ "$entries" -eq "$result_entries" ] && [ -f "$result_file" ] && [ ! -L "$result_file" ]; then
+        valid_result=$(jq -Rjse --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
+          --argjson attempt "$scan_attempt" --arg key "$scan_key" --arg module "$module" --arg os "$expected_os" --arg cgo "$expected_cgo" '
+          def text: type == "string" and length > 0;
+          def frame:
+            type == "object" and
+            all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
+            ((.version // "") == "" or (.module | text)) and
+            ((.package // "") == "" or (.module | text)) and
+            ((.function // "") == "" or (.package | text));
+          def evidence_level:
+            if any(.traces[][0]; (.function // "") != "") then "symbol"
+            elif any(.traces[][0]; (.package // "") != "") then "package"
+            else "module" end;
+          def valid_result:
+          .schema_version == 1 and .repository == $repository and .head_sha == $sha and .run_id == $run and
+          .run_attempt == $attempt and .scan_key == $key and .module == $module and
+          .target.goos == $os and .target.cgo == $cgo and (.target.goarch | strings | test("^[a-z0-9]+$")) and
+          (.go_version | text) and (.scanner_version | text) and .scan_status == "complete" and .scanner_exit == 0 and
+          (.findings | type == "array") and all(.findings[];
+            (.osv | text) and
+            (.module | text) and (.version | text) and (.fixed_version | type == "string") and
+            (.packages | type == "array") and all(.packages[]; text) and
+            (.traces | type == "array" and length > 0) and (. as $finding |
+              all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
+                all(.[]; frame) and (length == 1 or (.[0].function | text)))) and
+            .level == evidence_level);
+          (try (fromjson | valid_result) catch false) // false | tostring' "$result_file")
+      fi
+      if [ "$valid_result" = true ]; then
+        if [ "$is_batch" = true ]; then
+          has_symbol=$(jq -je 'any(.findings[]; .level == "symbol") | tostring' "$result_file")
+          if [ "$has_symbol" = true ]; then batch_symbol=true; fi
+        fi
+        consistent=$(jq -je --argjson job "$job" --argjson batch "$is_batch" --arg exit "$module_exit" '
+          (if $batch then any(.findings[]; .level == "symbol") as $symbol |
+            (($exit == "0" and ($symbol | not)) or ($exit == "3" and $symbol))
+          else ($job.conclusion == "success" or ($job.conclusion == "failure" and
+            $job.gate_failed and any(.findings[]; .level == "symbol"))) end) | tostring' "$result_file")
+        jq -c --argjson job "$job" --arg name "$name" '.target as $target | .findings[] |
+          {osv, module, version, level, fixed_version, target: $target, job: ($job | {name: $name, html_url}),
+           packages: ([. as $finding | .traces[][0] |
+             select($finding.level != "symbol" or (.function // "") != "") |
+             .package | select(type == "string" and length > 0)] | unique)}' \
+          "$result_file" >> "$report_tmp/findings.jsonl"
+        if [ "$consistent" != true ]; then
+          batch_error=true
+          unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+        fi
+      else
+        batch_error=true
+        unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+      fi
+    }
     collect_go_results() {
       download_dir="$report_tmp/artifact"
       : > "$report_tmp/findings.jsonl"
-      encoded_jobs=$(printf '%s' "$jobs" | jq -jr '.[] | select(.name | startswith("dependency-scan (go/")) | @base64 + " "')
+      encoded_jobs=$(printf '%s' "$jobs" | jq -jr '.[] | select(.name | startswith("dependency-scan (go/") or startswith("dependency-scan (go-batch/")) | @base64 + " "')
       for encoded in $encoded_jobs; do
         job=$(printf '%s' "$encoded" | jq -Rj '@base64d')
         name=$(printf '%s' "$job" | jq -j .name)
-        identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go/(?<module>[A-Za-z0-9_.-]+)/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")')
-        module=$(printf '%s' "$identity" | jq -j .module)
-        config=$(printf '%s' "$identity" | jq -j .config)
-        scan_key="go-$module-$config"
+        job_name="$name"
+        is_batch=false
+        case "$name" in
+          'dependency-scan (go-batch/'*)
+            is_batch=true
+            identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go-batch/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")')
+            config=$(printf '%s' "$identity" | jq -j .config)
+            scan_key="go-batch-$config" ;;
+          *)
+            identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go/(?<module>[A-Za-z0-9_.-]+)/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")')
+            module=$(printf '%s' "$identity" | jq -j .module)
+            config=$(printf '%s' "$identity" | jq -j .config)
+            scan_key="go-$module-$config"
+            ;;
+        esac
         scan_attempt=$(printf '%s' "$job" | jq -je '.run_attempt // 1 | numbers | tostring')
         artifact_name="security-scan-$scan_key-attempt-$scan_attempt"
         valid=$(printf '%s' "$artifacts" | jq -j --arg name "$artifact_name" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" '
@@ -170,55 +297,48 @@ vars:
           macos-*) expected_os=darwin ;;
         esac
         expected_cgo=${config##*cgo}
-        entries=0
-        for entry in "$download_dir"/* "$download_dir"/.[!.]* "$download_dir"/..?*; do
-          if [ -e "$entry" ] || [ -L "$entry" ]; then entries=$((entries + 1)); fi
-        done
-        result_file="$download_dir/security-result.json"
-        valid_result=false
-        if [ "$entries" -eq 1 ] && [ -f "$result_file" ] && [ ! -L "$result_file" ]; then
-          valid_result=$(jq -Rjse --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
-            --argjson attempt "$scan_attempt" --arg key "$scan_key" --arg module "$module" --arg os "$expected_os" --arg cgo "$expected_cgo" '
-            def text: type == "string" and length > 0;
-            def frame:
-              type == "object" and
-              all([.module, .version, .package, .function, .receiver][]; . == null or type == "string") and
-              ((.version // "") == "" or (.module | text)) and
-              ((.package // "") == "" or (.module | text)) and
-              ((.function // "") == "" or (.package | text));
-            def evidence_level:
-              if any(.traces[][0]; (.function // "") != "") then "symbol"
-              elif any(.traces[][0]; (.package // "") != "") then "package"
-              else "module" end;
-            def valid_result:
-            .schema_version == 1 and .repository == $repository and .head_sha == $sha and .run_id == $run and
-            .run_attempt == $attempt and .scan_key == $key and .module == $module and
-            .target.goos == $os and .target.cgo == $cgo and (.target.goarch | strings | test("^[a-z0-9]+$")) and
-            (.go_version | text) and (.scanner_version | text) and .scan_status == "complete" and .scanner_exit == 0 and
-            (.findings | type == "array") and all(.findings[];
-              (.osv | text) and
-              (.module | text) and (.version | text) and (.fixed_version | type == "string") and
-              (.packages | type == "array") and all(.packages[]; text) and
-              (.traces | type == "array" and length > 0) and (. as $finding |
-                all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
-                  all(.[]; frame) and (length == 1 or (.[0].function | text)))) and
-              .level == evidence_level);
-            (try (fromjson | valid_result) catch false) // false | tostring' "$result_file")
-        fi
-        if [ "$valid_result" = true ]; then
-          consistent=$(jq -je --argjson job "$job" '($job.conclusion == "success" or ($job.conclusion == "failure" and
-            $job.gate_failed and any(.findings[]; .level == "symbol"))) | tostring' "$result_file")
-          jq -c --argjson job "$job" '.target as $target | .findings[] |
-            {osv, module, version, level, fixed_version, target: $target, job: ($job | {name, html_url}),
-             packages: ([. as $finding | .traces[][0] |
-               select($finding.level != "symbol" or (.function // "") != "") |
-               .package | select(type == "string" and length > 0)] | unique)}' \
-            "$result_file" >> "$report_tmp/findings.jsonl"
-          if [ "$consistent" != true ]; then
+        if [ "$is_batch" = true ]; then
+          manifest="$download_dir/manifest.json"
+          modules=false
+          if [ -f "$manifest" ] && [ ! -L "$manifest" ]; then
+            modules=$(jq -Rjse '(try (fromjson | .modules as $modules |
+              if .schema_version == 1 and ($modules | type == "array" and length > 0) and
+                ($modules | unique | length) == ($modules | length) and
+                all($modules[]; type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$"))
+              then $modules else false end) catch false) | tojson' "$manifest")
+          fi
+          if [ "$modules" = false ]; then
             unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+            rm -rf -- "$download_dir"
+            continue
           fi
         else
-          unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+          modules=$(printf '%s' "$identity" | jq -cj '[.module]')
+        fi
+        module_names=$(printf '%s' "$modules" | jq -jr '.[] | . + " "')
+        batch_error=false
+        batch_symbol=false
+        for module in $module_names; do
+          name="$job_name"
+          result_dir="$download_dir"
+          if [ "$is_batch" = true ]; then
+            name="$job_name/$module"
+            result_dir="$download_dir/$module"
+          fi
+          scan_key="go-$module-$config"
+          if [ -L "$result_dir" ]; then
+            batch_error=true
+            unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
+          else
+            read_go_result
+          fi
+        done
+        if [ "$is_batch" = true ]; then
+          consistent=$(printf '%s' "$job" | jq -je --argjson error "$batch_error" --argjson symbol "$batch_symbol" '
+            (.conclusion == "success" or (.conclusion == "failure" and ($error or ($symbol and .gate_failed)))) | tostring')
+          if [ "$consistent" != true ]; then
+            unknown=$(printf '%s' "$unknown" | jq --arg name "$job_name" '. + [$name]')
+          fi
         fi
         rm -rf -- "$download_dir"
       done
@@ -261,7 +381,7 @@ vars:
       printf 'Go scan results unknown: %s\n' "$unknown_names" >&2
     fi
     findings=$(printf '%s' "$jobs" | jq '[.[] | select(.conclusion == "failure" and
-      (.name | startswith("dependency-scan (go/") | not) and
+      (.name | startswith("dependency-scan (go/") or startswith("dependency-scan (go-batch/") | not) and
       .gate_failed)]')
     finding_count=$(printf '%s' "$findings" | jq -je 'length | tostring')
     if [ "$finding_count" -eq 0 ] && [ "$go_findings" = '[]' ]; then
@@ -274,7 +394,7 @@ vars:
     run_number=$(printf '%s' "$run" | jq -je '.run_number | numbers | tostring')
     source="<!-- dependency-security-source:$sha:$GITHUB_RUN_ID -->"
     errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
-      --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") | not) and
+      --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") or startswith("dependency-scan (go-batch/") | not) and
         .conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] + $unknown | join(", ")')
     body=$(set -e
       printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
@@ -388,6 +508,17 @@ tasks:
       SECURITY_MODULE: '{{.MODULE}}'
     cmds:
       - '{{.SECURITY_SCAN}}'
+
+  security:scan-batch:
+    desc: Scan all requested Go modules on one native target
+    dir: '{{.ROOT_DIR}}'
+    requires:
+      vars: [MODULES]
+    env:
+      SECURITY_MODULES: '{{.MODULES}}'
+      SECURITY_ROOT_DIR: '{{.ROOT_DIR}}'
+    cmds:
+      - '{{.SECURITY_SCAN_BATCH}}'
 
   security:npm:
     desc: Audit locked npm dependencies; high and critical findings fail
