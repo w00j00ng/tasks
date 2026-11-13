@@ -18,7 +18,7 @@ tasks:
         esac
         fixture="$tmp/state.json"
         log="$tmp/log"
-        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
+        trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; if [ -n "${other_scan:-}" ]; then rmdir "$other_scan"; fi; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
         export GITHUB_REPOSITORY=w00j00ng/goproj GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
@@ -816,7 +816,11 @@ tasks:
             contains("본문 길이 제한") and contains("actions/runs/123/attempts/3"))'
         echo 'PASS 31: truncated bodies include the notice within the UTF-8 budget'
 
-        # 요청: symbol 결과의 최종 jq 판정 오류. 기대: 로컬·CI 모두 오류 종료값을 전달하고 취약점 출력 없음.
+        # 요청: 다른 스캔이 진행 중일 때 최종 jq 판정 오류. 기대: 오류 종료값 전달, 취약점 출력 없음, 다른 스캔 보존.
+        case "${OS:-}" in
+          Windows_NT) other_scan=$(mktemp -d -p "$(pwd -P)" .security-scan.XXXXXXXX) ;;
+          *) other_scan=$(mktemp -d "$(pwd -P)/.security-scan.XXXXXXXX") ;;
+        esac
         scanner_status=0
         jq -n '{config: {protocol_version: "v1.0.0", scanner_name: "govulncheck", scanner_version: "v1.9.0", scan_level: "symbol", scan_mode: "source"}},
           {SBOM: {go_version: "go1.27.4", modules: [], roots: ["example.com/app"]}},
@@ -835,6 +839,7 @@ tasks:
               }
               export SECURITY_RESULT_FILE="$tmp/result.json"
               if [ "$mode" = ci ]; then export GITHUB_OUTPUT="$tmp/scanner-output"; else unset GITHUB_OUTPUT; fi
+              cd "$tmp/module"
               scan
             ) > "$log" 2>&1
             result=$?
@@ -847,9 +852,34 @@ tasks:
             grep -qx 'Final jq assessment failed' "$log"
             test ! -s "$tmp/scanner-output"
             jq -e '.findings[0].level == "symbol"' "$tmp/result.json" > /dev/null
-            for leftover in .security-scan.*; do
+            for leftover in "$tmp/module"/.security-scan.*; do
               if [ -d "$leftover" ]; then echo "Scanner temp directory leaked: $leftover"; exit 1; fi
             done
           done
         done
         echo 'PASS 32: final jq errors fail local and CI scans without vulnerability output'
+        test -d "$other_scan"
+        rmdir "$other_scan"
+        unset other_scan
+
+        # 요청: Go 검사 작업 판별 jq 오류. 기대: 원래 종료값으로 실패하고 다운로드·이슈·댓글 없음.
+        for jq_status in 1 2 3 4 5 127; do
+          go_reset
+          (
+            jq() {
+              case "$1" in
+                -e|-je)
+                  case "${2:-}" in
+                    'any(.[]; .name | startswith("dependency-scan (go/"))'*)
+                      echo 'Go job assessment failed' >&2
+                      return "$jq_status" ;;
+                  esac ;;
+              esac
+              command jq "$@"
+            }
+            invoke "$jq_status"
+            check '(.issues | length) == 0 and (.comments | length) == 0 and all(.requests[]; .method == "GET")'
+            grep -qx 'Go job assessment failed' "$log"
+          )
+        done
+        echo 'PASS 33: Go job assessment errors fail reporting before downloads and issue writes'

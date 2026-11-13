@@ -140,7 +140,8 @@ vars:
     sha=$(printf '%s' "$run" | jq -je '.head_sha | strings | select(length > 0)')
     go_findings='[]'
     unknown='[]'
-    if printf '%s' "$jobs" | jq -e 'any(.[]; .name | startswith("dependency-scan (go/"))' > /dev/null; then
+    has_go=$(printf '%s' "$jobs" | jq -je 'any(.[]; .name | startswith("dependency-scan (go/")) | tostring')
+    if [ "$has_go" = true ]; then
       artifacts=$(api GET "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp | jq '[.[].artifacts[]]')
       report_root=$(pwd -P | jq -Rj 'gsub("\\\\"; "/")')
       case "${OS:-}" in
