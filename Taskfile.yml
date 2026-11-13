@@ -141,23 +141,14 @@ vars:
     go_findings='[]'
     unknown='[]'
     has_go=$(printf '%s' "$jobs" | jq -je 'any(.[]; .name | startswith("dependency-scan (go/")) | tostring')
-    if [ "$has_go" = true ]; then
-      artifacts=$(api GET "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp | jq '[.[].artifacts[]]')
-      report_root=$(pwd -P | jq -Rj 'gsub("\\\\"; "/")')
-      case "${OS:-}" in
-        Windows_NT) report_tmp=$(mktemp -d -p "$report_root" .security-report.XXXXXXXX) ;;
-        *) report_tmp=$(mktemp -d "$report_root/.security-report.XXXXXXXX") ;;
-      esac
-      report_tmp=$(cd "$report_tmp" && pwd -P | jq -Rj 'gsub("\\\\"; "/")')
-      case "$report_tmp" in "$report_root"/.security-report.*) ;; *) exit 1 ;; esac
-      trap 'rm -rf -- "$report_tmp"' EXIT
+    collect_go_results() {
       download_dir="$report_tmp/artifact"
       : > "$report_tmp/findings.jsonl"
       encoded_jobs=$(printf '%s' "$jobs" | jq -jr '.[] | select(.name | startswith("dependency-scan (go/")) | @base64 + " "')
       for encoded in $encoded_jobs; do
         job=$(printf '%s' "$encoded" | jq -Rj '@base64d')
         name=$(printf '%s' "$job" | jq -j .name)
-        identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go/(?<module>[A-Za-z0-9_.-]+)/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")') || exit 1
+        identity=$(printf '%s' "$job" | jq -ce '.name | capture("^dependency-scan \\(go/(?<module>[A-Za-z0-9_.-]+)/(?<config>linux-cgo[01]|windows-cgo0|macos-cgo1)\\)$")')
         module=$(printf '%s' "$identity" | jq -j .module)
         config=$(printf '%s' "$identity" | jq -j .config)
         scan_key="go-$module-$config"
@@ -166,16 +157,13 @@ vars:
         valid=$(printf '%s' "$artifacts" | jq -j --arg name "$artifact_name" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" '
           [.[] | select(.name == $name)] | length == 1 and
           (.[0] | .expired == false and .workflow_run.id == $run and .workflow_run.head_sha == $sha) | tostring')
-        if [ "$valid" != true ] || [ "$(printf '%s' "$job" | jq -j .status)" != completed ]; then
+        job_status=$(printf '%s' "$job" | jq -j .status)
+        if [ "$valid" != true ] || [ "$job_status" != completed ]; then
           unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
           continue
         fi
         mkdir "$download_dir"
-        if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact_name" --dir "$download_dir"; then
-          rm -rf -- "$report_tmp"
-          trap - EXIT
-          exit 1
-        fi
+        gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact_name" --dir "$download_dir" >&2
         case "$config" in
           linux-*) expected_os=linux ;;
           windows-*) expected_os=windows ;;
@@ -187,8 +175,9 @@ vars:
           if [ -e "$entry" ] || [ -L "$entry" ]; then entries=$((entries + 1)); fi
         done
         result_file="$download_dir/security-result.json"
-        if [ "$entries" -eq 1 ] && [ -f "$result_file" ] && [ ! -L "$result_file" ] &&
-          jq -se --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
+        valid_result=false
+        if [ "$entries" -eq 1 ] && [ -f "$result_file" ] && [ ! -L "$result_file" ]; then
+          valid_result=$(jq -Rjse --arg repository "$GITHUB_REPOSITORY" --arg sha "$sha" --argjson run "$GITHUB_RUN_ID" \
             --argjson attempt "$scan_attempt" --arg key "$scan_key" --arg module "$module" --arg os "$expected_os" --arg cgo "$expected_cgo" '
             def text: type == "string" and length > 0;
             def frame:
@@ -201,7 +190,7 @@ vars:
               if any(.traces[][0]; (.function // "") != "") then "symbol"
               elif any(.traces[][0]; (.package // "") != "") then "package"
               else "module" end;
-            if length == 1 then .[0] else error("expected one security result") end |
+            def valid_result:
             .schema_version == 1 and .repository == $repository and .head_sha == $sha and .run_id == $run and
             .run_attempt == $attempt and .scan_key == $key and .module == $module and
             .target.goos == $os and .target.cgo == $cgo and (.target.goarch | strings | test("^[a-z0-9]+$")) and
@@ -213,15 +202,19 @@ vars:
               (.traces | type == "array" and length > 0) and (. as $finding |
                 all(.traces[]; type == "array" and length > 0 and .[0].module == $finding.module and .[0].version == $finding.version and
                   all(.[]; frame) and (length == 1 or (.[0].function | text)))) and
-              .level == evidence_level)' "$result_file" > /dev/null; then
+              .level == evidence_level);
+            (try (fromjson | valid_result) catch false) // false | tostring' "$result_file")
+        fi
+        if [ "$valid_result" = true ]; then
+          consistent=$(jq -je --argjson job "$job" '($job.conclusion == "success" or ($job.conclusion == "failure" and
+            $job.gate_failed and any(.findings[]; .level == "symbol"))) | tostring' "$result_file")
           jq -c --argjson job "$job" '.target as $target | .findings[] |
             {osv, module, version, level, fixed_version, target: $target, job: ($job | {name, html_url}),
              packages: ([. as $finding | .traces[][0] |
                select($finding.level != "symbol" or (.function // "") != "") |
                .package | select(type == "string" and length > 0)] | unique)}' \
             "$result_file" >> "$report_tmp/findings.jsonl"
-          if ! jq -e --argjson job "$job" '$job.conclusion == "success" or ($job.conclusion == "failure" and
-            $job.gate_failed and any(.findings[]; .level == "symbol"))' "$result_file" > /dev/null; then
+          if [ "$consistent" != true ]; then
             unknown=$(printf '%s' "$unknown" | jq --arg name "$name" '. + [$name]')
           fi
         else
@@ -229,22 +222,49 @@ vars:
         fi
         rm -rf -- "$download_dir"
       done
-      go_findings=$(jq -cjs 'group_by([.osv, .module, .version, .level]) | map(.[0] + {
+      jq -cjs --argjson unknown "$unknown" 'group_by([.osv, .module, .version, .level]) | map(.[0] + {
         targets: (map(.target) | unique), jobs: (map(.job) | unique_by([.name, .html_url])),
         packages: ([.[].packages[]] | unique),
-        fixed_versions: (map(if .fixed_version == "" then "미제공" else .fixed_version end) | unique)})' "$report_tmp/findings.jsonl")
+        fixed_versions: (map(if .fixed_version == "" then "미제공" else .fixed_version end) | unique)}) |
+        {findings: ., unknown: $unknown}' "$report_tmp/findings.jsonl"
+    }
+    if [ "$has_go" = true ]; then
+      artifacts=$(api GET "actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" --paginate --slurp | jq '[.[].artifacts[]]')
+      report_root=$(pwd -P | jq -Rj 'gsub("\\\\"; "/")')
+      case "${OS:-}" in
+        Windows_NT) allocated_dir=$(mktemp -d -p "$report_root" .security-report.XXXXXXXX) ;;
+        *) allocated_dir=$(mktemp -d "$report_root/.security-report.XXXXXXXX") ;;
+      esac
+      report_tmp=$(cd "$allocated_dir" && pwd -P | jq -Rj 'gsub("\\\\"; "/")') || {
+        status=$?; rmdir "$allocated_dir" || :; exit "$status"
+      }
+      case "$report_tmp" in "$report_root"/.security-report.*) ;; *) rmdir "$allocated_dir" || :; exit 1 ;; esac
+      trap 'rm -rf -- "$report_tmp"' EXIT
+      # Task's shell can skip EXIT cleanup on errexit inside a command substitution.
+      set +e
+      summary=$(set -e; collect_go_results)
+      status=$?
       rm -rf -- "$report_tmp"
+      cleanup_status=$?
       trap - EXIT
+      set -e
+      if [ "$status" -ne 0 ]; then exit "$status"; fi
+      if [ "$cleanup_status" -ne 0 ]; then exit "$cleanup_status"; fi
+      unknown=$(printf '%s' "$summary" | jq -cj .unknown)
+      go_findings=$(printf '%s' "$summary" | jq -cj .findings)
     fi
     report_status=0
-    if [ "$(printf '%s' "$unknown" | jq -r length)" -gt 0 ]; then
+    unknown_count=$(printf '%s' "$unknown" | jq -je 'length')
+    if [ "$unknown_count" -gt 0 ]; then
       report_status=1
-      printf 'Go scan results unknown: %s\n' "$(printf '%s' "$unknown" | jq -r 'join(", ")')" >&2
+      unknown_names=$(printf '%s' "$unknown" | jq -j 'join(", ")')
+      printf 'Go scan results unknown: %s\n' "$unknown_names" >&2
     fi
     findings=$(printf '%s' "$jobs" | jq '[.[] | select(.conclusion == "failure" and
       (.name | startswith("dependency-scan (go/") | not) and
       .gate_failed)]')
-    if [ "$(printf '%s' "$findings" | jq -j 'length | tostring')" -eq 0 ] && [ "$go_findings" = '[]' ]; then
+    finding_count=$(printf '%s' "$findings" | jq -je 'length | tostring')
+    if [ "$finding_count" -eq 0 ] && [ "$go_findings" = '[]' ]; then
       exit "$report_status"
     fi
     run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT"
@@ -256,7 +276,8 @@ vars:
     errors=$(printf '%s' "$jobs" | jq -j --argjson findings "$findings" \
       --argjson unknown "$unknown" '[.[] | select((.name | startswith("dependency-scan (go/") | not) and
         .conclusion != "success" and (. as $job | $findings | index($job) | not)) | .name] + $unknown | join(", ")')
-    body=$(printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
+    body=$(set -e
+      printf '%s\n' "$marker" "<!-- dependency-security-run:$run_number:$GITHUB_RUN_ATTEMPT -->" "$source" \
       'main 정기 의존성 검사에서 보안 점검 결과가 발견되었습니다.' '' \
       "- 검사일: $scanned_at KST" "- 대상 커밋: \`$sha\`" "- 실행: [검사 로그]($run_url)"
       printf '%s' "$go_findings" | jq -r '"- Go 보고 항목: 호출 경로 확인 \([.[] | select(.level == "symbol")] | length)건, 의존성 업데이트 경고 \([.[] | select(.level != "symbol")] | length)건"'
@@ -316,6 +337,7 @@ vars:
     fi
     number=$(printf '%s' "$existing" | jq -j '.number // empty | tostring')
     if [ -n "$number" ]; then
+      handled=$(printf '%s' "$existing" | jq -je '.handled | tostring')
       # Only scan identity is needed to recover an update interrupted by closure or API failure.
       previous=$(printf '%s' "$existing" | jq -j '.reported | [
         ([match("<!-- dependency-security-run:[0-9]+:[0-9]+ -->").string][0] // ""),
@@ -323,22 +345,23 @@ vars:
         ([match("[0-9a-f]{40}").string][0] // ""),
         ([match("/actions/runs/[0-9]+/").string][0] // "")
         ] | join("\n") | @base64')
-      issue=$(printf '%s' "$body" | jq -Rs --arg previous "$previous" \
-        '{body: (. + "\n<!-- dependency-security-pending:" + $previous + " -->")}' |
-        api PATCH "issues/$number" --input -)
+      payload=$(printf '%s' "$body" | jq -Rs --arg previous "$previous" \
+        '{body: (. + "\n<!-- dependency-security-pending:" + $previous + " -->")}')
+      issue=$(printf '%s' "$payload" | api PATCH "issues/$number" --input -)
       state=$(printf '%s' "$issue" | jq -je '.state | select(. == "open" or . == "closed")')
       if [ "$state" = open ]; then
-        printf '%s' "$body" | jq -Rs '{body: .}' | api PATCH "issues/$number" --input - > /dev/null
+        payload=$(printf '%s' "$body" | jq -Rs '{body: .}')
+        printf '%s' "$payload" | api PATCH "issues/$number" --input - > /dev/null
       else
-        if [ "$(printf '%s' "$existing" | jq -j '.handled | tostring')" = true ]; then
+        if [ "$handled" = true ]; then
           exit "$report_status"
         fi
         number=
       fi
     fi
     if [ -z "$number" ]; then
-      issue=$(printf '%s' "$body" | jq -Rs '{title: "의존성 보안 취약점 정기 검사", body: .}' |
-        api POST issues --input -)
+      payload=$(printf '%s' "$body" | jq -Rs '{title: "의존성 보안 취약점 정기 검사", body: .}')
+      issue=$(printf '%s' "$payload" | api POST issues --input -)
       number=$(printf '%s' "$issue" | jq -je '.number | numbers | tostring')
     fi
     day_marker="<!-- dependency-security-alert:$day -->"
@@ -348,7 +371,8 @@ vars:
     if [ "$notified" != true ]; then
       comment=$(printf '%s\n%s' "$day_marker" \
         "@w00j00ng $day KST 정기 의존성 검사에서 확인할 보안 점검 결과가 있습니다. [검사 결과]($run_url)와 갱신된 본문을 확인해 주세요.")
-      jq -n --arg body "$comment" '{body: $body}' | api POST "issues/$number/comments" --input - > /dev/null
+      payload=$(jq -n --arg body "$comment" '{body: $body}')
+      printf '%s' "$payload" | api POST "issues/$number/comments" --input - > /dev/null
     fi
     exit "$report_status"
 

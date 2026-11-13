@@ -18,6 +18,7 @@ tasks:
         esac
         fixture="$tmp/state.json"
         log="$tmp/log"
+        other_scan=
         trap 'rm -f "$fixture" "$log" "$tmp/result.json" "$tmp/scanner.json" "$tmp/scanner-output" "$tmp/Taskfile.entry.yml" "$tmp/payload.json" "$tmp/matrix.json"; if [ -n "${other_scan:-}" ]; then rmdir "$other_scan"; fi; rmdir "$tmp/module" 2>/dev/null || true; rmdir "$tmp"' EXIT
         export GITHUB_EVENT_NAME=schedule GITHUB_REF=refs/heads/main
         export GITHUB_API_URL=https://api.github.com GITHUB_SERVER_URL=https://github.com
@@ -883,3 +884,63 @@ tasks:
           )
         done
         echo 'PASS 33: Go job assessment errors fail reporting before downloads and issue writes'
+
+        # 판정이나 본문 작성 도중 실패하면 경고를 누락하거나 이슈를 중복 생성하지 않는다.
+        for stage in unknown findings tempdir identity status artifact conclusion summary handled create pending finalize comment; do
+          go_reset
+          case "$stage" in
+            unknown) change '.artifacts = []' ;;
+            findings) reset; change '.jobs[0].name = "dependency-scan (npm)"' ;;
+            handled) invoke 0; change '.requests = [] | .close_before_patch = 42' ;;
+            pending|finalize) invoke 0; change '.requests = []' ;;
+          esac
+          (
+            cd "$tmp/module"
+            jq() {
+              case "$stage|$1|$PWD" in
+                tempdir\|-Rj\|*.security-report.*) echo 'Injected report failure' >&2; return 2 ;;
+              esac
+              case "$stage|$*" in
+                'unknown|'*' length'|'findings|'*' length | tostring'|'status|'*' .status'|\
+                'identity|'*'.name | capture('*|'artifact|'*'def evidence_level:'*|'conclusion|'*'$job.conclusion == "success"'*|\
+                'summary|'*'"- Go 보고 항목:'*|'handled|'*' .handled | tostring')
+                  echo 'Injected report failure' >&2
+                  return 2 ;;
+                'create|'*'{title: '*|'pending|'*'{body: (. + '*|'finalize|'*'{body: .}'|'comment|'*'{body: $body}')
+                  command jq "$@"
+                  echo 'Injected report failure' >&2
+                  return 2 ;;
+              esac
+              command jq "$@"
+            }
+            invoke 2
+            grep -qx 'Injected report failure' "$log"
+            for leftover in .security-report.*; do
+              if [ -d "$leftover" ]; then echo "Report temp directory leaked: $leftover"; exit 1; fi
+            done
+            case "$stage" in
+              handled) check '(.issues | length) == 1 and (.comments | length) == 1 and
+                all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+              pending) check 'all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+              finalize) check '[.requests[] | select(.method == "PATCH")] | length == 1' ;;
+              comment) check '(.issues | length) == 1 and (.comments | length) == 0 and
+                all(.requests[]; .method != "POST" or .path == "issues")' ;;
+              *) check '(.issues | length) == 0 and (.comments | length) == 0 and
+                all(.requests[]; .method != "PATCH" and .method != "POST")' ;;
+            esac
+          )
+        done
+        echo 'PASS 34: report errors propagate without duplicate or partial findings'
+
+        # 자식 테스트가 첫 보고에서 중단돼도 호출자가 넘긴 빈 디렉터리를 보존한다.
+        jq -n --arg source {{.TASKFILE_DIR | shellQuote}}/Taskfile.yml \
+          '{version: "3", silent: true, includes: {shared: {taskfile: $source, dir: ".", flatten: true}},
+            tasks: {entry: {cmds: [{task: "security:test", vars: {SECURITY_REPORT: "exit 87"}}]}}}' > "$tmp/Taskfile.entry.yml"
+        set +e
+        other_scan="$tmp/module" task --silent --exit-code --taskfile "$tmp/Taskfile.entry.yml" entry > "$log" 2>&1
+        result=$?
+        set -e
+        test "$result" -eq 1
+        grep -Fq 'Expected exit 0; got 87' "$log"
+        test -d "$tmp/module"
+        echo 'PASS 35: early test failure preserves the caller directory'
